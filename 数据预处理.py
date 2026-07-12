@@ -3,13 +3,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from pathlib import Path
 
 # ===================== 1. 配置与路径设置 =====================
-# 【重要提示】请将此处的文件路径替换为您本地的Excel文件路径
-input_file_path = '/mnt/附件1：样例数据.xlsx'
+# 基于脚本所在目录定位文件，兼容 Windows 且不依赖启动目录
+base_dir = Path(__file__).resolve().parent
+input_file_path = base_dir / '题目材料' / '2601(12日晚上18：00）' / '附件1：样例数据.xlsx'
+output_dir = base_dir / '预处理结果'
+output_dir.mkdir(parents=True, exist_ok=True)
+
 # 处理后数据保存路径
-output_csv_path = '/mnt/高血脂症数据_预处理完成.csv'
-output_excel_path = '/mnt/高血脂症数据_预处理完成.xlsx'
+output_csv_path = output_dir / '高血脂症数据_预处理完成.csv'
+output_excel_path = output_dir / '高血脂症数据_预处理完成.xlsx'
 
 # 中文字体配置
 plt.rcParams['font.sans-serif'] = ['SimHei']
@@ -146,7 +151,7 @@ plt.title('预处理后核心数值指标分布箱线图', fontsize=16)
 plt.xlabel('数值范围', fontsize=12)
 plt.ylabel('特征列', fontsize=12)
 plt.tight_layout()
-processed_boxplot_path = '/mnt/预处理后核心指标箱线图.png'
+processed_boxplot_path = output_dir / '预处理后核心指标箱线图.png'
 plt.savefig(processed_boxplot_path, dpi=300, bbox_inches='tight')
 plt.close()
 print(f"预处理后核心指标箱线图已保存至：{processed_boxplot_path}")
@@ -162,7 +167,7 @@ corr_matrix = df_processed[core_cols].corr()
 sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt='.2f')
 plt.title('预处理后核心指标相关性热力图', fontsize=16)
 plt.tight_layout()
-processed_corr_path = '/mnt/预处理后核心指标相关性热力图.png'
+processed_corr_path = output_dir / '预处理后核心指标相关性热力图.png'
 plt.savefig(processed_corr_path, dpi=300, bbox_inches='tight')
 plt.close()
 print(f"预处理后核心指标相关性热力图已保存至：{processed_corr_path}")
