@@ -1,0 +1,19 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter temporary files
+.ipynb_checkpoints/
+
+# Office temporary lock files
+~$*
+
+# Local agent and temporary working files
+.agents/
+tmp/
+
+# Local environment files
+.env
+.env.*
