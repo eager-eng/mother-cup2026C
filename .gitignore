@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv312/
 venv/
 
 # Jupyter temporary files
