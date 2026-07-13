@@ -1,0 +1,10 @@
+{
+  "rows": 1000,
+  "columns": 44,
+  "duplicate_sample_ids": 0,
+  "missing_values": 0,
+  "label_prevalence": 0.793,
+  "diagnostic_rule_agreement": 1.0,
+  "phlegm_constitution_count": 278,
+  "activity_identity_max_error": 0.0
+}

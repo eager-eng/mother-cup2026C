@@ -1,0 +1,6 @@
+{
+  "patient_count": 278,
+  "all_plans_feasible": true,
+  "budget_limit": 2000,
+  "target_effect_ratio": 0.9
+}
