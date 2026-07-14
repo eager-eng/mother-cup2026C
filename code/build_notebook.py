@@ -45,8 +45,8 @@ def main() -> None:
     sources = [
         """from code.solution import (\n    PARAMS, OUTPUT_DIR, build_run_summary, configure_plotting, load_and_preprocess,\n    run_problem1, run_problem2, run_problem3, write_json, write_results_report\n)\nimport time\nstart_time = time.perf_counter()\nfont_name = configure_plotting()\nprint(f\"绘图字体：{font_name}\")\n""",
         """df, data_quality = load_and_preprocess()\nprint(data_quality)\n""",
-        """res1 = run_problem1(df, PARAMS)\nprint(res1[\"screen\"].round(4).to_string(index=False))\nprint(res1[\"constitution\"].round(4).to_string(index=False))\n""",
-        """res2 = run_problem2(df, PARAMS)\nprint(res2[\"candidate_models\"].round(4).to_string(index=False))\nprint(res2[\"test_tiers\"].round(4).to_string(index=False))\nprint(res2[\"combinations\"].head(10).round(4).to_string(index=False))\n""",
+        """res1 = run_problem1(df, PARAMS)\nprint(res1[\"endpoint_performance\"].round(4).to_string(index=False))\nprint(res1[\"screen\"].round(4).to_string(index=False))\nprint(res1[\"constitution\"].round(4).to_string(index=False))\nprint(res1[\"constitution_sensitivity\"].round(4).to_string(index=False))\n""",
+        """res2 = run_problem2(df, PARAMS)\nprint(res2[\"candidate_models\"].round(4).to_string(index=False))\nprint(res2[\"test_tiers\"].round(4).to_string(index=False))\nprint(res2[\"profile\"].round(4).to_string(index=False))\nprint(res2[\"combinations\"].head(10).round(4).to_string(index=False))\n""",
         """res3 = run_problem3(df, PARAMS)\nprint(res3[\"summary\"][res3[\"summary\"][\"样本ID\"].isin([1,2,3])].round(4).to_string(index=False))\nprint(res3[\"plans_123\"].round(4).to_string(index=False))\nprint(res3[\"matching\"].round(4).to_string(index=False))\n""",
         """elapsed_seconds = time.perf_counter() - start_time\nwrite_results_report(data_quality, res1, res2, res3, elapsed_seconds)\nrun_summary = build_run_summary(font_name, data_quality, res1, res2, res3, elapsed_seconds)\nwrite_json(OUTPUT_DIR / \"run_summary.json\", run_summary)\nprint(f\"完整流程通过，耗时 {elapsed_seconds:.1f} 秒。\")\nprint(\"所有 CSV/JSON 已保存到 code/outputs，PDF 图已保存到 figures。\")\n""",
     ]
