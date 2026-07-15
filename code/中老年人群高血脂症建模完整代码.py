@@ -48,6 +48,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import (
+    KFold,
     RepeatedKFold,
     RepeatedStratifiedKFold,
     StratifiedKFold,
@@ -56,7 +57,7 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, plot_tree
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1183,6 +1184,158 @@ def score_band(score: float) -> str:
     return "强化调理(≥62)"
 
 
+def patient_rule_stratum(age_group: int, activity_score: float, score: float) -> str:
+    """按题面调理阈值与耐受约束，把患者唯一映射到九类规则分层。"""
+    max_intensity = max(allowed_intensities(int(age_group), float(activity_score)))
+    return f"{score_band(float(score))}｜最大耐受{max_intensity}级"
+
+
+def tolerance_rule(max_intensity: int) -> str:
+    rules = {
+        1: "年龄组=5，或活动总分<40",
+        2: "年龄组1-2且40≤活动总分<60，或年龄组3-4且活动总分≥40",
+        3: "年龄组1-2且活动总分≥60",
+    }
+    return rules[int(max_intensity)]
+
+
+def score_band_rule(band: str) -> str:
+    rules = {
+        "基础调理(≤58)": "初始痰湿积分≤58",
+        "中度调理(59-61)": "59≤初始痰湿积分≤61",
+        "强化调理(≥62)": "初始痰湿积分≥62",
+    }
+    return rules[str(band)]
+
+
+def fit_q3_cart_surrogate(summary: pd.DataFrame) -> dict[str, Any]:
+    """用受限多输出 CART 近似动态规划的首月强度—频率联合决策。"""
+    features = ["年龄组", "活动量表总分", "初始痰湿积分"]
+    targets = ["推荐首月活动强度", "推荐首月每周次数"]
+    x = summary[features].astype(float).reset_index(drop=True)
+    y = summary[targets].astype(int).to_numpy()
+    cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    candidate_rows: list[dict[str, Any]] = []
+
+    for depth, min_fraction, max_leaves in itertools.product(
+        (2, 3, 4, 5, 6), (0.05, 0.08, 0.10), (6, 9, 12)
+    ):
+        fold_joint: list[float] = []
+        fold_component: list[float] = []
+        fold_feasible: list[bool] = []
+        for train_idx, valid_idx in cv.split(x):
+            min_leaf = max(2, math.ceil(min_fraction * len(train_idx)))
+            model = DecisionTreeClassifier(
+                max_depth=depth,
+                min_samples_leaf=min_leaf,
+                max_leaf_nodes=max_leaves,
+                random_state=RANDOM_STATE,
+            )
+            model.fit(x.iloc[train_idx], y[train_idx])
+            predicted = np.asarray(model.predict(x.iloc[valid_idx]), dtype=int)
+            fold_joint.append(float(np.mean(np.all(predicted == y[valid_idx], axis=1))))
+            fold_component.append(float(np.mean(predicted == y[valid_idx])))
+            allowed_max = np.array([
+                max(allowed_intensities(int(row[0]), float(row[1])))
+                for row in x.iloc[valid_idx].to_numpy()
+            ])
+            fold_feasible.append(bool(
+                np.all(predicted[:, 0] <= allowed_max)
+                and np.all((predicted[:, 1] >= 5) & (predicted[:, 1] <= 10))
+            ))
+
+        full_min_leaf = max(2, math.ceil(min_fraction * len(x)))
+        full_model = DecisionTreeClassifier(
+            max_depth=depth,
+            min_samples_leaf=full_min_leaf,
+            max_leaf_nodes=max_leaves,
+            random_state=RANDOM_STATE,
+        ).fit(x, y)
+        candidate_rows.append({
+            "最大深度": depth,
+            "最小叶节点比例": min_fraction,
+            "最大叶节点数": max_leaves,
+            "全样本叶节点数": int(full_model.get_n_leaves()),
+            "五折联合处方一致率": float(np.mean(fold_joint)),
+            "五折分量一致率": float(np.mean(fold_component)),
+            "五折耐受约束通过": bool(all(fold_feasible)),
+        })
+
+    candidates = pd.DataFrame(candidate_rows)
+    feasible = candidates[candidates["五折耐受约束通过"]].copy()
+    if feasible.empty:
+        raise AssertionError("问题三 CART 候选均产生耐受约束冲突")
+    best = feasible.sort_values(
+        ["五折联合处方一致率", "五折分量一致率", "全样本叶节点数", "最大深度", "最小叶节点比例", "最大叶节点数"],
+        ascending=[False, False, True, True, False, True],
+    ).iloc[0]
+    final_model = DecisionTreeClassifier(
+        max_depth=int(best["最大深度"]),
+        min_samples_leaf=max(2, math.ceil(float(best["最小叶节点比例"]) * len(x))),
+        max_leaf_nodes=int(best["最大叶节点数"]),
+        random_state=RANDOM_STATE,
+    ).fit(x, y)
+    selected_mask = (
+        candidates["最大深度"].eq(int(best["最大深度"]))
+        & candidates["最小叶节点比例"].eq(float(best["最小叶节点比例"]))
+        & candidates["最大叶节点数"].eq(int(best["最大叶节点数"]))
+    )
+    candidates["是否选用"] = selected_mask
+    predicted = np.asarray(final_model.predict(x), dtype=int)
+    leaf_ids = final_model.apply(x).astype(int)
+    paths = cart_path_strings(final_model, x)
+    rule_rows: list[dict[str, Any]] = []
+    actual_pairs = pd.Series(
+        [f"{a}级-{f}次/周" for a, f in y], index=summary.index, dtype="object"
+    )
+    for leaf in np.unique(leaf_ids):
+        mask = leaf_ids == leaf
+        first = int(np.flatnonzero(mask)[0])
+        group = summary.loc[mask]
+        distribution = actual_pairs.loc[mask].value_counts()
+        row: dict[str, Any] = {
+            "叶节点": int(leaf),
+            "规则路径": paths[first],
+            "患者人数": int(mask.sum()),
+            "代理首月活动强度": int(predicted[first, 0]),
+            "代理首月每周次数": int(predicted[first, 1]),
+            "叶节点联合一致率": float(np.mean(np.all(predicted[mask] == y[mask], axis=1))),
+            "实际处方分布": "；".join(f"{name}:{count}" for name, count in distribution.items()),
+            "首月成本中位数": float(group["首月总成本"].median()) if "首月总成本" in group else np.nan,
+            "六个月成本中位数": float(group["六个月总成本"].median()),
+            "六个月成本Q1": float(group["六个月总成本"].quantile(0.25)),
+            "六个月成本Q3": float(group["六个月总成本"].quantile(0.75)),
+            "降低分数中位数": float(group["降低分数"].median()),
+            "降低分数Q1": float(group["降低分数"].quantile(0.25)),
+            "降低分数Q3": float(group["降低分数"].quantile(0.75)),
+            "降低比例中位数": float(group["降低比例"].median()),
+        }
+        rule_rows.append(row)
+    rules = pd.DataFrame(rule_rows).sort_values("叶节点").reset_index(drop=True)
+    metrics = {
+        "max_depth": int(best["最大深度"]),
+        "min_leaf_fraction": float(best["最小叶节点比例"]),
+        "max_leaf_nodes": int(best["最大叶节点数"]),
+        "leaf_count": int(final_model.get_n_leaves()),
+        "cv_joint_fidelity": float(best["五折联合处方一致率"]),
+        "cv_component_fidelity": float(best["五折分量一致率"]),
+        "train_joint_fidelity": float(np.mean(np.all(predicted == y, axis=1))),
+        "train_component_fidelity": float(np.mean(predicted == y)),
+        "all_cv_feasible": bool(best["五折耐受约束通过"]),
+    }
+    return {
+        "model": final_model,
+        "features": features,
+        "targets": targets,
+        "candidates": candidates,
+        "rules": rules,
+        "metrics": metrics,
+        "leaf_ids": leaf_ids,
+        "paths": paths,
+        "predicted": predicted,
+    }
+
+
 def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str, Any]:
     patients = df[df["体质标签"].eq(5)].copy()
     cache: dict[tuple[float, int], dict[str, Any]] = {}
@@ -1209,15 +1362,27 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         if max(result["plan"]["活动强度"]) > max(allowed_original):
             raise AssertionError("缓存方案违反原患者耐受约束")
         plan = result["plan"]
+        initial_band = score_band(float(row["痰湿质积分"]))
         summary_rows.append({
             "样本ID": int(row["样本ID"]),
             "年龄组": int(row["年龄组"]),
             "活动量表总分": float(row["活动量表总分"]),
             "初始痰湿积分": float(row["痰湿质积分"]),
-            "初始调理等级": score_band(float(row["痰湿质积分"])),
+            "初始调理等级": initial_band,
             "最大允许活动强度": max_intensity,
+            "匹配分层": patient_rule_stratum(
+                int(row["年龄组"]), float(row["活动量表总分"]), float(row["痰湿质积分"])
+            ),
+            "耐受度判定规则": tolerance_rule(max_intensity),
+            "首月调理等级": int(plan.iloc[0]["调理等级"]),
+            "首月调理方式": str(plan.iloc[0]["核心调理方式"]),
             "推荐首月活动强度": int(plan.iloc[0]["活动强度"]),
             "推荐首月每周次数": int(plan.iloc[0]["每周次数"]),
+            "首月总成本": int(plan.iloc[0]["当月总成本"]),
+            "调理等级序列": "-".join(plan["调理等级"].astype(int).astype(str)),
+            "活动强度序列": "-".join(plan["活动强度"].astype(int).astype(str)),
+            "训练频率序列": "-".join(plan["每周次数"].astype(int).astype(str)),
+            "月成本序列": "-".join(plan["当月总成本"].astype(int).astype(str)),
             "最终痰湿积分": result["final_score"],
             "降低分数": result["reduction"],
             "降低比例": result["reduction"] / float(row["痰湿质积分"]),
@@ -1249,21 +1414,63 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     if not all(selected_on_frontier.values()):
         raise AssertionError(f"样本1—3推荐点并非全部位于Pareto前沿：{selected_on_frontier}")
 
-    # 患者特征—最优方案匹配规律。
+    # CART 仅作为首月处方的可解释代理；个体最终方案仍以动态规划为准。
+    cart = fit_q3_cart_surrogate(summary)
+    summary["CART规则叶节点"] = cart["leaf_ids"]
+    summary["CART规则路径"] = cart["paths"]
+    summary["CART代理首月活动强度"] = cart["predicted"][:, 0]
+    summary["CART代理首月每周次数"] = cart["predicted"][:, 1]
+    summary["CART规则一致标记"] = (
+        summary["CART代理首月活动强度"].eq(summary["推荐首月活动强度"])
+        & summary["CART代理首月每周次数"].eq(summary["推荐首月每周次数"])
+    )
+
+    # 九类硬约束分层：用于快速匹配与解释，不替代个体动态规划。
     matching_rows = []
     for (band, max_intensity), group in summary.groupby(["初始调理等级", "最大允许活动强度"], observed=True):
-        mode_pair = Counter(zip(group["推荐首月活动强度"], group["推荐首月每周次数"])).most_common(1)[0][0]
+        mode_pair, mode_count = Counter(
+            zip(group["推荐首月活动强度"], group["推荐首月每周次数"])
+        ).most_common(1)[0]
+        mode_level = int(group["首月调理等级"].mode().iloc[0])
+        mode_method = str(group["首月调理方式"].mode().iloc[0])
+        mode_mask = (
+            group["推荐首月活动强度"].eq(int(mode_pair[0]))
+            & group["推荐首月每周次数"].eq(int(mode_pair[1]))
+        )
+        typical_first_cost = int(group.loc[mode_mask, "首月总成本"].iloc[0])
+        stratum = f"{band}｜最大耐受{int(max_intensity)}级"
         matching_rows.append({
+            "匹配分层": stratum,
+            "患者特征组合": f"{score_band_rule(str(band))}；{tolerance_rule(int(max_intensity))}",
             "初始痰湿分层": band,
             "最大允许活动强度": int(max_intensity),
             "患者人数": len(group),
+            "典型首月调理等级": mode_level,
+            "典型首月调理方式": mode_method,
             "典型首月活动强度": int(mode_pair[0]),
             "典型首月每周次数": int(mode_pair[1]),
+            "典型首月处方成本": typical_first_cost,
+            "典型首月处方覆盖率": float(mode_count / len(group)),
+            "首月成本中位数": float(group["首月总成本"].median()),
+            "首月成本Q1": float(group["首月总成本"].quantile(0.25)),
+            "首月成本Q3": float(group["首月总成本"].quantile(0.75)),
             "六个月成本中位数": float(group["六个月总成本"].median()),
+            "六个月成本Q1": float(group["六个月总成本"].quantile(0.25)),
+            "六个月成本Q3": float(group["六个月总成本"].quantile(0.75)),
             "降低分数中位数": float(group["降低分数"].median()),
+            "降低分数Q1": float(group["降低分数"].quantile(0.25)),
+            "降低分数Q3": float(group["降低分数"].quantile(0.75)),
+            "降低比例中位数": float(group["降低比例"].median()),
+            "降低比例Q1": float(group["降低比例"].quantile(0.25)),
+            "降低比例Q3": float(group["降低比例"].quantile(0.75)),
             "效果保留率中位数": float(group["效果保留率"].median()),
+            "低样本分层": bool(len(group) < 15),
+            "规则用途": "首月快速初筛；完整六个月方案需运行动态规划",
         })
-    matching = pd.DataFrame(matching_rows).sort_values(["最大允许活动强度", "初始痰湿分层"]).reset_index(drop=True)
+    band_order = {"基础调理(≤58)": 1, "中度调理(59-61)": 2, "强化调理(≥62)": 3}
+    matching = pd.DataFrame(matching_rows)
+    matching["_分层顺序"] = matching["初始痰湿分层"].map(band_order)
+    matching = matching.sort_values(["最大允许活动强度", "_分层顺序"]).drop(columns="_分层顺序").reset_index(drop=True)
 
     # 一因素灵敏度：仅 ID 1/2/3，避免混合改变多个参数。
     sensitivity_rows = []
@@ -1296,10 +1503,25 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     plan_123.to_csv(OUTPUT_DIR / "question3_sample_1_2_3_monthly_plans.csv", index=False, encoding="utf-8-sig")
     pareto_123.to_csv(OUTPUT_DIR / "question3_sample_1_2_3_pareto.csv", index=False, encoding="utf-8-sig")
     matching.to_csv(OUTPUT_DIR / "question3_matching_rules.csv", index=False, encoding="utf-8-sig")
+    cart["candidates"].to_csv(OUTPUT_DIR / "question3_cart_surrogate_candidates.csv", index=False, encoding="utf-8-sig")
+    cart["rules"].to_csv(OUTPUT_DIR / "question3_cart_rules.csv", index=False, encoding="utf-8-sig")
     sensitivity.to_csv(OUTPUT_DIR / "question3_sensitivity.csv", index=False, encoding="utf-8-sig")
+    write_json(OUTPUT_DIR / "question3_rule_consistency.json", {
+        "deterministic_strata": int(summary["匹配分层"].nunique()),
+        "patient_count": len(summary),
+        "cart_metrics": cart["metrics"],
+        "cart_joint_match_count": int(summary["CART规则一致标记"].sum()),
+        "cart_joint_mismatch_count": int((~summary["CART规则一致标记"]).sum()),
+        "rule_role": "首月处方解释代理；完整六个月方案以动态规划为准",
+    })
     write_json(OUTPUT_DIR / "question3_constraint_checks.json", {
         "patient_count": len(summary), "all_plans_feasible": bool(all(all_checks)),
         "budget_limit": int(params["q3_max_cost"]), "target_effect_ratio": float(params["q3_target_effect_ratio"]),
+        "deterministic_strata": int(summary["匹配分层"].nunique()),
+        "all_effective_frequencies_at_least_five": bool(
+            summary["训练频率序列"].str.split("-").explode().astype(int).ge(5).all()
+        ),
+        "cart_all_cv_feasible": bool(cart["metrics"]["all_cv_feasible"]),
         "selected_points_on_pareto_frontier": selected_on_frontier,
     })
 
@@ -1361,7 +1583,47 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     )
     save_figure(fig, "问题3_成本降幅Pareto前沿.pdf")
 
+    # 患者特征—首月处方 CART 代理树；叶节点仅用于解释动态规划首月动作。
+    fig, ax = plt.subplots(figsize=(18.0, 10.5))
+    tree_artists = plot_tree(
+        cart["model"],
+        feature_names=cart["features"],
+        filled=True,
+        rounded=True,
+        impurity=False,
+        node_ids=True,
+        proportion=False,
+        precision=2,
+        fontsize=6,
+        ax=ax,
+    )
+    tree = cart["model"].tree_
+    classes = cart["model"].classes_
+    for artist in tree_artists:
+        text = artist.get_text()
+        first_line = text.splitlines()[0]
+        if not first_line.startswith("node #"):
+            continue
+        node = int(first_line.split("#", maxsplit=1)[1])
+        action = []
+        for output_index, output_classes in enumerate(classes):
+            class_count = len(output_classes)
+            best_class_index = int(np.argmax(tree.value[node, output_index, :class_count]))
+            action.append(int(output_classes[best_class_index]))
+        artist.set_text(text + f"\n代理处方={action[0]}级,{action[1]}次/周")
+    ax.text(
+        0.01, 0.01,
+        "value第一行为强度类别计数、第二行为频率类别计数；硬约束与个体动态规划优先。",
+        transform=ax.transAxes, ha="left", va="bottom", fontsize=9,
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.9, "edgecolor": "#777777"},
+    )
+    save_figure(fig, "问题3_患者特征首月方案规则树.pdf")
+
     print(f"问题3：已对全部 {len(summary)} 名痰湿质患者求解，约束回代全部通过={all(all_checks)}")
+    print(
+        f"九类硬约束分层覆盖 {matching['患者人数'].sum()} 人；CART五折联合处方一致率="
+        f"{cart['metrics']['cv_joint_fidelity']:.3f}，训练一致率={cart['metrics']['train_joint_fidelity']:.3f}"
+    )
     for sample_id in (1, 2, 3):
         row = summary[summary["样本ID"].eq(sample_id)].iloc[0]
         print(
@@ -1371,6 +1633,8 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     return {
         "summary": summary, "plans_123": plan_123, "pareto_123": pareto_123,
         "matching": matching, "sensitivity": sensitivity,
+        "cart_model": cart["model"], "cart_candidates": cart["candidates"],
+        "cart_rules": cart["rules"], "cart_metrics": cart["metrics"],
         "selected_on_frontier": selected_on_frontier,
         "all_plans_feasible": bool(all(all_checks)),
     }
@@ -1386,6 +1650,7 @@ def write_results_report(
 ) -> None:
     q2_test = q2["test_tiers"]
     q3_samples = q3["summary"][q3["summary"]["样本ID"].isin([1, 2, 3])].sort_values("样本ID")
+    q3_matching = q3["matching"]
     q1_phlegm_perf = q1["endpoint_performance"].loc[q1["endpoint_performance"]["终点"].eq("痰湿严重度")].iloc[0]
     q1_lipid_perf = q1["endpoint_performance"].loc[q1["endpoint_performance"]["终点"].eq("高血脂关联筛查")].iloc[0]
     q1_phlegm_or = q1["constitution"].loc[q1["constitution"]["体质标签"].eq(5)].iloc[0]
@@ -1453,6 +1718,8 @@ def write_results_report(
         f"对附件中全部 {len(q3['summary'])} 名体质标签 5 患者完成动态规划。推荐方案采用 ε-约束：先求预算内最大可降幅，再选择达到其 {PARAMS['q3_target_effect_ratio']:.0%} 以上且成本最低的方案。",
         "样本1—3的最终推荐点均位于对应成本—积分降幅 Pareto 前沿，图中以星形标记。",
         "题目未给中医调理方式的独立疗效参数，基准模型只把其作为随积分分层的必选成本；额外疗效 0%/1%/2% 已作为敏感性场景而非基准事实。",
+        "为明确患者特征—方案匹配规律，先按痰湿积分阈值与身体耐受约束形成九类确定性分层：最大耐受3级为年龄组1—2且活动总分≥60；最大耐受2级为年龄组1—2且40≤活动总分<60，或年龄组3—4且活动总分≥40；其余为最大耐受1级。",
+        f"受限多输出CART仅解释首月活动强度与频率，选用深度{q3['cart_metrics']['max_depth']}、最小叶节点比例{q3['cart_metrics']['min_leaf_fraction']:.0%}、{q3['cart_metrics']['leaf_count']}个叶节点；五折联合处方一致率为{q3['cart_metrics']['cv_joint_fidelity']:.1%}，训练内一致率为{q3['cart_metrics']['train_joint_fidelity']:.1%}。该一致率不足以替代个体动态规划，因此硬约束和动态规划结果始终优先。",
         "",
         "|样本ID|真实初始积分|年龄组|活动总分|最终积分|降低分数|总成本|最大允许强度|",
         "|---:|---:|---:|---:|---:|---:|---:|---:|",
@@ -1464,7 +1731,23 @@ def write_results_report(
         )
     lines += [
         "",
-        "逐月方案见 `results/question3_sample_1_2_3_monthly_plans.csv`，全体患者匹配规律见 `results/question3_matching_rules.csv`。",
+        "九类患者特征—首月典型方案如下；带 * 的分层样本少于15人，结论仅作探索性参考。成本列分别为典型首月处方成本和该层六个月总成本中位数。",
+        "",
+        "|匹配分层|人数|首月调理等级|首月活动强度|每周次数|首月成本|六个月成本|积分降幅|降幅比例|处方覆盖率|",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for _, row in q3_matching.iterrows():
+        marker = "*" if bool(row["低样本分层"]) else ""
+        lines.append(
+            f"|{row['匹配分层']}{marker}|{int(row['患者人数'])}|{int(row['典型首月调理等级'])}|"
+            f"{int(row['典型首月活动强度'])}|{int(row['典型首月每周次数'])}|"
+            f"{row['典型首月处方成本']:.0f}|{row['六个月成本中位数']:.0f}|"
+            f"{row['降低分数中位数']:.1f}|{row['降低比例中位数']:.1%}|{row['典型首月处方覆盖率']:.1%}|"
+        )
+    lines += [
+        "",
+        "规则表用于首月快速初筛；患者完整六个月调理等级、活动强度、训练频率和月成本序列均由动态规划逐月输出。题面说明每周少于5次时积分基本稳定，因此最终有效方案均保持每周5—10次，不采用“4次/周仍有显著降幅”的示例性说法。",
+        "逐月方案见 `results/question3_sample_1_2_3_monthly_plans.csv`，九类硬约束映射与CART叶节点规则分别保存在对应结果表中。",
         "",
         "## 灵敏度分析",
         "",
@@ -1475,7 +1758,7 @@ def write_results_report(
         "",
         "- 问题一允许共同指标为空；四项诊断血脂不会进入高血脂关联筛查模型。",
         "- 问题二模型不含诊断血脂及其派生变量；每名患者只输出一个统计风险等级，临床管理提示独立保存。",
-        "- 问题三逐月回代年龄、活动评分、频率、预算与积分单调约束；全部患者通过，样本1—3选择点均在Pareto前沿。",
+        "- 问题三逐月回代年龄、活动评分、有效频率、预算与积分单调约束；278人均唯一进入九类分层和一个CART叶节点，样本1—3选择点均在Pareto前沿。",
         "- ID 1/2/3 均直接按附件样本 ID 读取，不再手工构造患者参数。",
         "- 所有论文引用数值均保存为 CSV/JSON，图表统一输出论文用矢量 PDF。",
         "",
@@ -1512,6 +1795,9 @@ def build_run_summary(
         "question2_cart_rules": q2["cart_rules"].to_dict(orient="records"),
         "question2_test_tiers": q2["test_tiers"].to_dict(orient="records"),
         "question3_samples": q3["summary"][q3["summary"]["样本ID"].isin([1, 2, 3])].to_dict(orient="records"),
+        "question3_matching_rules": q3["matching"].to_dict(orient="records"),
+        "question3_cart_metrics": q3["cart_metrics"],
+        "question3_cart_rules": q3["cart_rules"].to_dict(orient="records"),
         "question3_all_feasible": True,
         "question3_selected_on_frontier": q3["selected_on_frontier"],
     }
@@ -1604,8 +1890,48 @@ def validate_results(
     assert q3["all_plans_feasible"]
     summary = q3["summary"]
     assert len(summary) == quality["phlegm_constitution_count"]
+    assert summary["样本ID"].is_unique
     assert summary["六个月总成本"].le(PARAMS["q3_max_cost"]).all()
     assert summary["最终痰湿积分"].le(summary["初始痰湿积分"] + 1e-9).all()
+    required_q3_columns = {
+        "匹配分层", "首月调理等级", "首月调理方式", "首月总成本",
+        "调理等级序列", "活动强度序列", "训练频率序列", "月成本序列",
+        "CART规则叶节点", "CART规则路径", "CART代理首月活动强度",
+        "CART代理首月每周次数", "CART规则一致标记",
+    }
+    assert required_q3_columns <= set(summary.columns)
+    expected_strata = summary.apply(
+        lambda row: patient_rule_stratum(row["年龄组"], row["活动量表总分"], row["初始痰湿积分"]),
+        axis=1,
+    )
+    assert summary["匹配分层"].equals(expected_strata)
+    assert summary["匹配分层"].nunique() == 9
+    for sequence_column in ("调理等级序列", "活动强度序列", "训练频率序列", "月成本序列"):
+        assert summary[sequence_column].str.split("-").str.len().eq(PARAMS["q3_months"]).all()
+    frequency_values = summary["训练频率序列"].str.split("-").explode().astype(int)
+    assert frequency_values.between(5, 10).all()
+    intensity_values = summary["活动强度序列"].str.split("-")
+    assert all(max(map(int, values)) <= allowed for values, allowed in zip(
+        intensity_values, summary["最大允许活动强度"]
+    ))
+    cost_values = summary["月成本序列"].str.split("-").apply(lambda values: sum(map(int, values)))
+    assert np.array_equal(cost_values.to_numpy(int), summary["六个月总成本"].to_numpy(int))
+    assert np.array_equal(
+        summary["月成本序列"].str.split("-").str[0].astype(int).to_numpy(),
+        summary["首月总成本"].to_numpy(int),
+    )
+    assert len(q3["matching"]) == 9
+    assert q3["matching"]["患者人数"].sum() == len(summary)
+    assert q3["matching"]["典型首月每周次数"].between(5, 10).all()
+    assert len(q3["cart_candidates"]) == 45
+    assert q3["cart_candidates"]["是否选用"].sum() == 1
+    assert q3["cart_candidates"]["五折耐受约束通过"].all()
+    assert q3["cart_rules"]["患者人数"].sum() == len(summary)
+    assert summary["CART规则叶节点"].notna().all()
+    assert summary["CART规则路径"].str.len().gt(0).all()
+    assert q3["cart_metrics"]["all_cv_feasible"]
+    assert np.isclose(q3["cart_metrics"]["cv_joint_fidelity"], 0.7846103896, atol=2e-6)
+    assert np.isclose(q3["cart_metrics"]["train_joint_fidelity"], 0.8309352518, atol=2e-6)
     expected_samples = {1: (48.5, 1014), 2: (37.0, 1240), 3: (33.0, 1674)}
     for sample_id, (expected_score, expected_cost) in expected_samples.items():
         row = summary.loc[summary["样本ID"].eq(sample_id)].iloc[0]
@@ -1618,7 +1944,7 @@ def validate_results(
         ]
         assert len(selected) == 1
     assert all(q3["selected_on_frontier"].values())
-    checks.append("问题三：全体可行性、预算与样本1—3 Pareto选择点通过")
+    checks.append("问题三：九类分层、CART代理、全体可行性与样本1—3 Pareto选择点通过")
 
     return {"status": "PASS", "check_count": len(checks), "checks": checks}
 
