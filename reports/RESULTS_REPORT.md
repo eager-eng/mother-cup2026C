@@ -5,7 +5,7 @@
 - Python：3.12.13
 - 平台：Windows-11-10.0.26200-SP0
 - 随机种子：42
-- 完整运行耗时：66.1 秒
+- 完整运行耗时：74.4 秒
 
 ## 数据读取与预处理
 
@@ -49,12 +49,12 @@
 |2|58.0|1|40.0|37.0|21.0|1240|2|
 |3|59.0|1|63.0|33.0|26.0|1674|3|
 
-逐月方案见 `code/outputs/question3_sample_1_2_3_monthly_plans.csv`，全体患者匹配规律见 `code/outputs/question3_matching_rules.csv`。
+逐月方案见 `results/question3_sample_1_2_3_monthly_plans.csv`，全体患者匹配规律见 `results/question3_matching_rules.csv`。
 
 ## 灵敏度分析
 
 问题二对痰湿高阈值、痰湿极高阈值和低活动阈值分别上下扰动5分；问题三分别扰动积分步长、活动效果、预算上限和调理额外月降幅。
-所有场景保留在 `code/outputs/question2_rule_sensitivity.csv` 与 `code/outputs/question3_sensitivity.csv`。
+所有场景保留在 `results/question2_rule_sensitivity.csv` 与 `results/question3_sensitivity.csv`。
 
 ## 约束与一致性校验
 
@@ -62,12 +62,12 @@
 - 问题二模型不含诊断血脂及其派生变量；每名患者只输出一个可追溯管理等级。
 - 问题三逐月回代年龄、活动评分、频率、预算与积分单调约束；全部患者通过。
 - ID 1/2/3 均直接按附件样本 ID 读取，不再手工构造患者参数。
-- 所有论文引用数值均保存为 CSV/JSON，图表同时输出 PNG 与 PDF。
+- 所有论文引用数值均保存为 CSV/JSON，图表统一输出论文用矢量 PDF。
 
 ## 可复现运行方式
 
 ```powershell
 py -3.12 -m venv .venv312
 .\.venv312\Scripts\python.exe -m pip install -r requirements-py312.txt
-.\.venv312\Scripts\python.exe code\build_notebook.py
+.\.venv312\Scripts\python.exe code\中老年人群高血脂症建模完整代码.py
 ```

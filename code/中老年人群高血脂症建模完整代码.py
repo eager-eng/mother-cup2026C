@@ -1,4 +1,16 @@
+"""中老年人群高血脂症风险预警及干预方案优化——三问完整建模代码。
+
+本文件从题目原始 Excel 附件直接读取数据，依次完成问题一、问题二和
+问题三，并生成结果表、论文图表、结果报告与自动验收结论。为便于论文
+附录复制，所有建模代码均集中在本文件中。
+"""
+
 from __future__ import annotations
+
+
+# ============================================================================
+# 第一部分：公共配置与数据预处理
+# ============================================================================
 
 import itertools
 import json
@@ -47,8 +59,7 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW_PATH = ROOT / "题目材料" / "2601(12日晚上18：00）" / "附件1：样例数据.xlsx"
-PREPROCESS_DIR = ROOT / "预处理结果"
-OUTPUT_DIR = ROOT / "code" / "outputs"
+OUTPUT_DIR = ROOT / "results"
 FIGURE_DIR = ROOT / "figures"
 REPORT_DIR = ROOT / "reports"
 RANDOM_STATE = 42
@@ -93,7 +104,7 @@ PARAMS = {
 
 
 def ensure_dirs() -> None:
-    for directory in (PREPROCESS_DIR, OUTPUT_DIR, FIGURE_DIR, REPORT_DIR):
+    for directory in (OUTPUT_DIR, FIGURE_DIR, REPORT_DIR):
         directory.mkdir(parents=True, exist_ok=True)
 
 
@@ -126,9 +137,9 @@ def configure_plotting() -> str:
     return font_name
 
 
-def save_figure(fig: plt.Figure, compatibility_png: str, pdf_name: str) -> None:
+def save_figure(fig: plt.Figure, pdf_name: str) -> None:
+    """仅保存论文使用的矢量 PDF，避免在项目根目录产生重复 PNG。"""
     fig.tight_layout()
-    fig.savefig(ROOT / compatibility_png, bbox_inches="tight")
     fig.savefig(FIGURE_DIR / pdf_name, bbox_inches="tight")
     plt.close(fig)
 
@@ -210,33 +221,16 @@ def load_and_preprocess() -> tuple[pd.DataFrame, dict[str, Any]]:
     if quality["duplicate_sample_ids"] != 0 or quality["activity_identity_max_error"] > 1e-9:
         raise ValueError(f"数据一致性校验未通过：{quality}")
 
-    df.to_csv(PREPROCESS_DIR / "高血脂症数据_预处理完成.csv", index=False, encoding="utf-8-sig")
-    df.to_excel(PREPROCESS_DIR / "高血脂症数据_预处理完成.xlsx", index=False)
-    df.to_excel(PREPROCESS_DIR / "高血脂症数据_建模字段转换完成.xlsx", index=False)
     write_json(OUTPUT_DIR / "data_quality.json", quality)
-
-    # 覆盖原 EDA 图，确保中文可读。
-    eda_cols = ["总胆固醇_TC", "甘油三酯_TG", "低密度脂蛋白_LDL_C", "高密度脂蛋白_HDL_C", "血糖", "BMI"]
-    long_df = df[eda_cols].melt(var_name="指标", value_name="数值")
-    fig, ax = plt.subplots(figsize=(10, 5.5))
-    sns.boxplot(data=long_df, x="指标", y="数值", ax=ax, color="#4C78A8")
-    ax.set_xlabel("")
-    ax.set_ylabel("测量值")
-    ax.tick_params(axis="x", rotation=20)
-    fig.tight_layout()
-    fig.savefig(PREPROCESS_DIR / "预处理后核心指标箱线图.png", bbox_inches="tight")
-    plt.close(fig)
-
-    corr_cols = ["痰湿质积分", "活动量表总分", "总胆固醇_TC", "甘油三酯_TG", "低密度脂蛋白_LDL_C", "高密度脂蛋白_HDL_C", "血糖", "血尿酸", "BMI"]
-    fig, ax = plt.subplots(figsize=(9, 7))
-    sns.heatmap(df[corr_cols].corr(method="spearman"), cmap="RdBu_r", center=0, annot=True, fmt=".2f", ax=ax)
-    fig.tight_layout()
-    fig.savefig(PREPROCESS_DIR / "预处理后核心指标相关性热力图.png", bbox_inches="tight")
-    plt.close(fig)
 
     print(f"数据读取完成：{len(df)} 行，痰湿质患者 {quality['phlegm_constitution_count']} 人")
     print(f"诊断标签与四项血脂异常规则一致率：{quality['diagnostic_rule_agreement']:.1%}")
     return df, quality
+
+
+# ============================================================================
+# 第二部分：问题一——双终点指标筛选与九体质贡献分析
+# ============================================================================
 
 
 def benjamini_hochberg(p_values: np.ndarray) -> np.ndarray:
@@ -465,14 +459,14 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         ax.axvline(0, color="black", linewidth=0.8)
         ax.set_xlabel("折外置换重要性")
         ax.set_title(endpoint)
-    save_figure(fig, "问题1_共识得分排序.png", "问题1_共识得分排序.pdf")
+    save_figure(fig, "问题1_共识得分排序.pdf")
 
     heat = screen.pivot(index="指标名称", columns="终点", values="折外正重要性频率").reindex(all_features)
     fig, ax = plt.subplots(figsize=(7.5, 5.5))
     sns.heatmap(heat, annot=True, fmt=".2f", vmin=0, vmax=1, cmap="Blues", mask=heat.isna(), ax=ax)
     ax.set_xlabel("")
     ax.set_ylabel("")
-    save_figure(fig, "问题1_双终点频率热力图.png", "问题1_双终点频率热力图.pdf")
+    save_figure(fig, "问题1_双终点频率热力图.pdf")
 
     plot_or = constitution[constitution["体质标签"].ne(1)].sort_values("调整OR")
     y_pos = np.arange(len(plot_or))
@@ -485,7 +479,7 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.set_yticks(y_pos, plot_or["体质类型"])
     ax.set_xlabel("调整优势比 OR（相对平和质，95%CI）")
     ax.set_ylabel("")
-    save_figure(fig, "问题1_体质贡献度OR.png", "问题1_体质贡献度OR.pdf")
+    save_figure(fig, "问题1_体质贡献度OR.pdf")
 
     print(f"问题1：痰湿终点入选 {selected_phlegm}；非诊断高血脂关联入选 {selected_lipid}；共同指标 {shared}")
     print(f"九体质标签整体LR检验 P={global_p:.3g}，未调整卡方检验 P={chi2_p:.3g}")
@@ -495,6 +489,11 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         "constitution": constitution, "constitution_sensitivity": constitution_sensitivity,
         "constitution_global_p": global_p, "constitution_chi2_p": float(chi2_p),
     }
+
+
+# ============================================================================
+# 第三部分：问题二——非血脂关联筛查与三级管理规则
+# ============================================================================
 
 
 def apply_management_rules(
@@ -760,7 +759,7 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.set_xlabel("假阳性率")
     ax.set_ylabel("真阳性率")
     ax.legend(frameon=False, loc="lower right")
-    save_figure(fig, "问题2_筛查模型ROC.png", "问题2_筛查模型ROC.pdf")
+    save_figure(fig, "问题2_筛查模型ROC.pdf")
 
     # 三级管理优先级分布与当前异常率。
     fig, ax1 = plt.subplots(figsize=(7.2, 5.3))
@@ -775,7 +774,7 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax2.set_ylabel("实际患病率")
     for bar, rate in zip(bars, test_tiers["实际患病率"]):
         ax1.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2, f"{rate:.1%}", ha="center")
-    save_figure(fig, "问题2_三级风险分布.png", "问题2_三级风险分布.pdf")
+    save_figure(fig, "问题2_三级风险分布.pdf")
 
     # 校准曲线。
     prob_true, prob_pred = calibration_curve(y_test, test_prob, n_bins=8, strategy="quantile")
@@ -785,7 +784,7 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.set_xlabel("预测概率")
     ax.set_ylabel("观察阳性率")
     ax.legend(frameon=False)
-    save_figure(fig, "问题2_校准曲线.png", "问题2_校准曲线.pdf")
+    save_figure(fig, "问题2_校准曲线.pdf")
 
     rates = test_tiers["实际患病率"].tolist()
     print(f"问题2：选用 {best_name}，独立测试 AUC={metrics['auc']:.3f}，Brier={metrics['brier']:.3f}")
@@ -800,6 +799,11 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         "rule_sensitivity": rule_sensitivity,
         "train_idx": train_idx, "test_idx": test_idx,
     }
+
+
+# ============================================================================
+# 第四部分：问题三——六个月个体化干预方案优化
+# ============================================================================
 
 
 def allowed_intensities(age_group: int, activity_score: float) -> list[int]:
@@ -1055,7 +1059,7 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.set_ylabel("痰湿体质积分")
     ax.set_xticks(range(7))
     ax.legend(frameon=False)
-    save_figure(fig, "问题3_积分变化曲线.png", "问题3_积分变化曲线.pdf")
+    save_figure(fig, "问题3_积分变化曲线.pdf")
 
     # 成本—效果对比。
     sample_summary = summary[summary["样本ID"].isin([1, 2, 3])].sort_values("样本ID")
@@ -1071,7 +1075,7 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     handles1, labels1 = ax1.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(handles1 + handles2, labels1 + labels2, frameon=False, loc="upper left")
-    save_figure(fig, "问题3_成本效果对比.png", "问题3_成本效果对比.pdf")
+    save_figure(fig, "问题3_成本效果对比.pdf")
 
     print(f"问题3：已对全部 {len(summary)} 名痰湿质患者求解，约束回代全部通过={all(all_checks)}")
     for sample_id in (1, 2, 3):
@@ -1083,7 +1087,13 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     return {
         "summary": summary, "plans_123": plan_123, "pareto_123": pareto_123,
         "matching": matching, "sensitivity": sensitivity,
+        "all_plans_feasible": bool(all(all_checks)),
     }
+
+
+# ============================================================================
+# 第五部分：结果汇总与自动验收
+# ============================================================================
 
 
 def write_results_report(
@@ -1162,12 +1172,12 @@ def write_results_report(
         )
     lines += [
         "",
-        "逐月方案见 `code/outputs/question3_sample_1_2_3_monthly_plans.csv`，全体患者匹配规律见 `code/outputs/question3_matching_rules.csv`。",
+        "逐月方案见 `results/question3_sample_1_2_3_monthly_plans.csv`，全体患者匹配规律见 `results/question3_matching_rules.csv`。",
         "",
         "## 灵敏度分析",
         "",
         "问题二对痰湿高阈值、痰湿极高阈值和低活动阈值分别上下扰动5分；问题三分别扰动积分步长、活动效果、预算上限和调理额外月降幅。",
-        "所有场景保留在 `code/outputs/question2_rule_sensitivity.csv` 与 `code/outputs/question3_sensitivity.csv`。",
+        "所有场景保留在 `results/question2_rule_sensitivity.csv` 与 `results/question3_sensitivity.csv`。",
         "",
         "## 约束与一致性校验",
         "",
@@ -1175,14 +1185,14 @@ def write_results_report(
         "- 问题二模型不含诊断血脂及其派生变量；每名患者只输出一个可追溯管理等级。",
         "- 问题三逐月回代年龄、活动评分、频率、预算与积分单调约束；全部患者通过。",
         "- ID 1/2/3 均直接按附件样本 ID 读取，不再手工构造患者参数。",
-        "- 所有论文引用数值均保存为 CSV/JSON，图表同时输出 PNG 与 PDF。",
+        "- 所有论文引用数值均保存为 CSV/JSON，图表统一输出论文用矢量 PDF。",
         "",
         "## 可复现运行方式",
         "",
         "```powershell",
         "py -3.12 -m venv .venv312",
         ".\\.venv312\\Scripts\\python.exe -m pip install -r requirements-py312.txt",
-        ".\\.venv312\\Scripts\\python.exe code\\build_notebook.py",
+        ".\\.venv312\\Scripts\\python.exe code\\中老年人群高血脂症建模完整代码.py",
         "```",
         "",
     ]
@@ -1210,6 +1220,121 @@ def build_run_summary(
     }
 
 
+def validate_results(
+    df: pd.DataFrame,
+    quality: dict[str, Any],
+    q1: dict[str, Any],
+    q2: dict[str, Any],
+    q3: dict[str, Any],
+) -> dict[str, Any]:
+    """从内存结果独立回代三问的关键口径，失败时立即抛出断言。"""
+    checks: list[str] = []
+
+    # 问题一：标签一致性、泄漏排除、折外证据和分类体质 OR。
+    assert quality["rows"] == 1000
+    assert quality["duplicate_sample_ids"] == 0
+    assert quality["missing_values"] == 0
+    assert quality["diagnostic_rule_agreement"] == 1.0
+    diagnostic_features = {
+        "总胆固醇_TC", "甘油三酯_TG", "低密度脂蛋白_LDL_C", "高密度脂蛋白_HDL_C",
+    }
+    lipid_rows = q1["screen"].loc[q1["screen"]["终点"].eq("高血脂关联筛查")]
+    flagged = set(lipid_rows.loc[lipid_rows["是否诊断泄漏"], "指标名称"])
+    assert flagged == diagnostic_features
+    assert not lipid_rows.loc[lipid_rows["是否诊断泄漏"], "是否入选"].any()
+    assert q1["selected_phlegm"] == []
+    assert q1["selected_lipid"] == ["血尿酸"]
+    assert q1["shared"] == []
+    phlegm_r2 = float(q1["endpoint_performance"].loc[
+        q1["endpoint_performance"]["终点"].eq("痰湿严重度"), "均值"
+    ].iloc[0])
+    lipid_auc = float(q1["endpoint_performance"].loc[
+        q1["endpoint_performance"]["终点"].eq("高血脂关联筛查"), "均值"
+    ].iloc[0])
+    assert phlegm_r2 <= 0
+    assert np.isclose(phlegm_r2, -0.0563766472, atol=2e-6)
+    assert np.isclose(lipid_auc, 0.8479757691, atol=2e-6)
+    constitution = q1["constitution"]
+    assert len(constitution) == 9
+    assert constitution.loc[constitution["体质标签"].eq(1), "参照组"].iloc[0] == "平和质"
+    assert constitution.loc[constitution["体质标签"].eq(1), "调整OR"].iloc[0] == 1.0
+    assert constitution.loc[constitution["体质标签"].ne(1), "FDR_q值"].between(0, 1).all()
+    assert constitution["整体LR检验P值"].nunique() == 1
+    checks.append("问题一：泄漏排除、折外筛选、FDR及分类体质OR通过")
+
+    # 问题二：模型特征无诊断血脂；按患者原始字段重新生成唯一管理等级与触发规则。
+    leakage_tokens = (
+        "总胆固醇", "甘油三酯", "低密度脂蛋白", "高密度脂蛋白",
+        "TC异常", "TG异常", "LDL异常", "HDL异常", "任一血脂异常",
+    )
+    model_features = q2["metrics"]["model_features"]
+    assert all(not any(token in feature for token in leakage_tokens) for feature in model_features)
+    assert np.isclose(q2["metrics"]["auc"], 0.8211574953, atol=2e-6)
+    assert q2["test_tiers"].sort_values("风险等级编码")["人数"].astype(int).tolist() == [21, 247, 32]
+
+    test_frame = df.iloc[q2["test_idx"]]
+    lipid_abnormal = test_frame["任一血脂异常"].eq(1)
+    phlegm_score = test_frame["痰湿质积分"]
+    low_activity = test_frame["活动量表总分"].lt(40)
+    metabolic_abnormal = test_frame[["尿酸异常", "BMI异常", "血糖异常"]].max(axis=1).eq(1)
+    high_rule_1 = lipid_abnormal & phlegm_score.ge(60)
+    high_rule_2 = (~lipid_abnormal) & phlegm_score.ge(80) & low_activity
+    high_rule_3 = test_frame["体质标签"].eq(5) & phlegm_score.ge(60) & test_frame["尿酸异常"].eq(1)
+    expected_high = high_rule_1 | high_rule_2 | high_rule_3
+    expected_medium = (~expected_high) & (
+        lipid_abnormal | phlegm_score.ge(60) | low_activity | metabolic_abnormal
+    )
+    expected_code = np.where(expected_high, 3, np.where(expected_medium, 2, 1))
+    predictions = q2["test_predictions"].reset_index(drop=True)
+    assert predictions["样本ID"].is_unique
+    assert predictions["非血脂筛查概率"].between(0, 1).all()
+    assert np.array_equal(predictions["最终管理等级编码"].to_numpy(int), expected_code)
+
+    expected_triggers: list[str] = []
+    for position, idx in enumerate(test_frame.index):
+        reasons: list[str] = []
+        if bool(high_rule_1.loc[idx]):
+            reasons.append("血脂异常且痰湿积分≥60")
+        if bool(high_rule_2.loc[idx]):
+            reasons.append("血脂正常、痰湿积分≥80且活动总分<40")
+        if bool(high_rule_3.loc[idx]):
+            reasons.append("痰湿质、痰湿积分≥60且尿酸异常")
+        if not reasons and expected_code[position] == 2:
+            if bool(lipid_abnormal.loc[idx]):
+                reasons.append("血脂异常")
+            if bool(phlegm_score.loc[idx] >= 60):
+                reasons.append("痰湿积分≥60")
+            if bool(low_activity.loc[idx]):
+                reasons.append("活动总分<40")
+            if bool(metabolic_abnormal.loc[idx]):
+                reasons.append("至少一项代谢异常")
+        if not reasons:
+            reasons.append("未触发高危或中危规则")
+        expected_triggers.append("；".join(reasons))
+    assert predictions["触发规则"].tolist() == expected_triggers
+    checks.append("问题二：非血脂模型、三级人数、唯一等级及患者级触发规则通过")
+
+    # 问题三：全体方案约束通过，并锁定论文引用的样本1—3方案。
+    assert q3["all_plans_feasible"]
+    summary = q3["summary"]
+    assert len(summary) == quality["phlegm_constitution_count"]
+    assert summary["六个月总成本"].le(PARAMS["q3_max_cost"]).all()
+    assert summary["最终痰湿积分"].le(summary["初始痰湿积分"] + 1e-9).all()
+    expected_samples = {1: (48.5, 1014), 2: (37.0, 1240), 3: (33.0, 1674)}
+    for sample_id, (expected_score, expected_cost) in expected_samples.items():
+        row = summary.loc[summary["样本ID"].eq(sample_id)].iloc[0]
+        assert np.isclose(row["最终痰湿积分"], expected_score, atol=1e-9)
+        assert int(row["六个月总成本"]) == expected_cost
+    checks.append("问题三：全体可行性、预算与样本1—3方案通过")
+
+    return {"status": "PASS", "check_count": len(checks), "checks": checks}
+
+
+# ============================================================================
+# 第六部分：主运行入口
+# ============================================================================
+
+
 def run_all() -> dict[str, Any]:
     start = time.perf_counter()
     ensure_dirs()
@@ -1220,11 +1345,18 @@ def run_all() -> dict[str, Any]:
     q2 = run_problem2(df)
     q3 = run_problem3(df)
     elapsed = time.perf_counter() - start
-    write_results_report(quality, q1, q2, q3, elapsed)
     summary = build_run_summary(font, quality, q1, q2, q3, elapsed)
+    validation = validate_results(df, quality, q1, q2, q3)
+    summary["validation"] = validation
     write_json(OUTPUT_DIR / "run_summary.json", summary)
+    write_json(OUTPUT_DIR / "validation_summary.json", validation)
+    write_results_report(quality, q1, q2, q3, elapsed)
+    print(f"自动验收通过：{validation['check_count']} 组核心检查全部 PASS。")
     print(f"全部求解完成，耗时 {elapsed:.1f} 秒。")
-    return {"df": df, "quality": quality, "q1": q1, "q2": q2, "q3": q3, "summary": summary}
+    return {
+        "df": df, "quality": quality, "q1": q1, "q2": q2, "q3": q3,
+        "summary": summary, "validation": validation,
+    }
 
 
 if __name__ == "__main__":

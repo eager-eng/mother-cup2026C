@@ -1,21 +1,22 @@
 # 中老年人群高血脂症风险预警及干预方案优化
 
-本项目从原始附件直接复现三个问题，已修正样本 1/2/3 参数错配、问题一标签泄漏与训练内重要性偏差、九体质贡献口径错位、问题二概率阈值替代特征规则、三级输出冲突和中文图表乱码。
+本项目从原始附件直接复现三个问题。全部数据处理、模型求解、制图、结果导出和核心验收逻辑均位于一个 Python 文件中，并按问题一、问题二、问题三顺序编排，便于复制到论文附录。
 
 ## 运行
 
 ```powershell
 py -3.12 -m venv .venv312
 .\.venv312\Scripts\python.exe -m pip install -r requirements-py312.txt
-.\.venv312\Scripts\python.exe code\build_notebook.py
+.\.venv312\Scripts\python.exe code\中老年人群高血脂症建模完整代码.py
 ```
 
-运行后将覆盖根目录 `代码实现.ipynb` 和兼容 PNG，并生成：
+完整运行约需 1—2 分钟。运行结束会自动执行问题一至三的关键口径与约束检查，并生成：
 
-- `reports/ANALYSIS_MODELING_REPORT.md`
 - `reports/RESULTS_REPORT.md`
-- `code/outputs/*.csv|json`
+- `results/*.csv|json`
 - `figures/*.pdf`
+
+`code/` 中仅有 `中老年人群高血脂症建模完整代码.py`，其中六个带编号的分区可直接定位公共预处理、三个问题、结果验收和主入口。
 
 ## 建模边界
 

@@ -1,6 +1,6 @@
 {
   "font": "Microsoft YaHei",
-  "elapsed_seconds": 66.08605629997328,
+  "elapsed_seconds": 74.44100230000913,
   "data_quality": {
     "rows": 1000,
     "columns": 45,
@@ -20,8 +20,8 @@
     {
       "终点": "痰湿严重度",
       "指标": "折外R²",
-      "均值": -0.05637664720597216,
-      "标准差": 0.027614626926226155,
+      "均值": -0.056376647205972207,
+      "标准差": 0.027614626926226127,
       "折数": 15
     },
     {
@@ -55,7 +55,7 @@
     "recall_at_0.5": 0.9033613445378151,
     "precision_at_0.5": 0.8206106870229007,
     "f1_at_0.5": 0.86,
-    "test_probability_min": 0.19951118989938293,
+    "test_probability_min": 0.19951118989938285,
     "test_probability_max": 0.9869815838413774,
     "diagnostic_rule_agreement": 1.0,
     "model_features": [
@@ -171,5 +171,14 @@
       "六个月总成本": 1674
     }
   ],
-  "question3_all_feasible": true
+  "question3_all_feasible": true,
+  "validation": {
+    "status": "PASS",
+    "check_count": 3,
+    "checks": [
+      "问题一：泄漏排除、折外筛选、FDR及分类体质OR通过",
+      "问题二：非血脂模型、三级人数、唯一等级及患者级触发规则通过",
+      "问题三：全体可行性、预算与样本1—3方案通过"
+    ]
+  }
 }

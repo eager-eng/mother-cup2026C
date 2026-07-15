@@ -6,7 +6,7 @@
   "recall_at_0.5": 0.9033613445378151,
   "precision_at_0.5": 0.8206106870229007,
   "f1_at_0.5": 0.86,
-  "test_probability_min": 0.19951118989938293,
+  "test_probability_min": 0.19951118989938285,
   "test_probability_max": 0.9869815838413774,
   "diagnostic_rule_agreement": 1.0,
   "model_features": [
