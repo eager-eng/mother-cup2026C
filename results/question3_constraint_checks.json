@@ -2,5 +2,10 @@
   "patient_count": 278,
   "all_plans_feasible": true,
   "budget_limit": 2000,
-  "target_effect_ratio": 0.9
+  "target_effect_ratio": 0.9,
+  "selected_points_on_pareto_frontier": {
+    "1": true,
+    "2": true,
+    "3": true
+  }
 }

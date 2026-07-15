@@ -37,6 +37,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
+    accuracy_score,
     average_precision_score,
     brier_score_loss,
     confusion_matrix,
@@ -55,6 +56,7 @@ from sklearn.model_selection import (
 )
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.tree import DecisionTreeClassifier
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +96,9 @@ PARAMS = {
     "q1_cv_repeats": 3,
     "q1_permutation_repeats": 8,
     "q1_selection_frequency": 0.60,
+    "q1_constitution_bootstrap_repeats": 500,
     "q2_test_size": 0.30,
+    "q2_min_tier_fraction": 0.15,
     "q3_months": 6,
     "q3_weeks_per_month": 4,
     "q3_max_cost": 2000,
@@ -266,6 +270,50 @@ def fit_logistic_with_inference(x: np.ndarray, y: np.ndarray) -> dict[str, np.nd
     return {"coef": coef, "se": se, "p": p_values, "probability": probability, "log_likelihood": log_likelihood}
 
 
+def pareto_flags(values: np.ndarray) -> np.ndarray:
+    """返回二维或多维“越大越优”指标中的非支配解标记。"""
+    values = np.asarray(values, dtype=float)
+    flags = np.ones(len(values), dtype=bool)
+    for i in range(len(values)):
+        dominated = np.all(values >= values[i], axis=1) & np.any(values > values[i], axis=1)
+        flags[i] = not bool(dominated.any())
+    return flags
+
+
+def stratified_constitution_rank_bootstrap(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    covariates: list[str],
+    repeats: int,
+) -> pd.DataFrame:
+    """按结局分层重抽样，评估八种偏颇体质调整 OR 排名的不确定性。"""
+    rng = np.random.default_rng(RANDOM_STATE + 101)
+    strata = [np.flatnonzero(y == value) for value in (0, 1)]
+    ranks: list[np.ndarray] = []
+    top_counts = np.zeros(8, dtype=int)
+    for _ in range(repeats):
+        sampled = np.concatenate([rng.choice(index, size=len(index), replace=True) for index in strata])
+        sample = df.iloc[sampled]
+        sample_y = y[sampled]
+        covariate_z = StandardScaler().fit_transform(sample[covariates])
+        dummies = pd.get_dummies(sample["体质标签"].astype(int), dtype=float).reindex(columns=range(2, 10), fill_value=0)
+        model = LogisticRegression(C=1e6, solver="lbfgs", max_iter=2000, random_state=RANDOM_STATE)
+        model.fit(np.column_stack([dummies.to_numpy(float), covariate_z]), sample_y)
+        odds_ratios = np.exp(model.coef_[0][:8])
+        rank = stats.rankdata(-odds_ratios, method="average")
+        ranks.append(rank)
+        top_counts[int(np.argmax(odds_ratios))] += 1
+    rank_array = np.vstack(ranks)
+    return pd.DataFrame({
+        "体质标签": np.arange(2, 10),
+        "Bootstrap中位名次": np.median(rank_array, axis=0),
+        "Bootstrap名次95%区间下限": np.quantile(rank_array, 0.025, axis=0),
+        "Bootstrap名次95%区间上限": np.quantile(rank_array, 0.975, axis=0),
+        "位居首位频率": top_counts / repeats,
+        "Bootstrap次数": repeats,
+    })
+
+
 def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str, Any]:
     all_features = [
         "总胆固醇_TC", "甘油三酯_TG", "低密度脂蛋白_LDL_C", "高密度脂蛋白_HDL_C",
@@ -386,10 +434,34 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         })
 
     screen = pd.DataFrame(rows)
+    screen["结论层级"] = np.where(screen["是否诊断泄漏"], "泄漏排除", "验证性筛选")
+    exploratory_rows: list[dict[str, Any]] = []
+    for feature in non_diagnostic_features:
+        phlegm_row = screen.loc[(screen["终点"].eq("痰湿严重度")) & screen["指标名称"].eq(feature)].iloc[0]
+        lipid_row = screen.loc[(screen["终点"].eq("高血脂关联筛查")) & screen["指标名称"].eq(feature)].iloc[0]
+        exploratory_rows.append({
+            "指标名称": feature,
+            "痰湿折外重要性正向值": max(0.0, float(phlegm_row["折外置换重要性均值"])),
+            "高血脂折外重要性正向值": max(0.0, float(lipid_row["折外置换重要性均值"])),
+        })
+    exploratory_pareto = pd.DataFrame(exploratory_rows)
+    for column in ("痰湿折外重要性正向值", "高血脂折外重要性正向值"):
+        maximum = float(exploratory_pareto[column].max())
+        exploratory_pareto[column.replace("正向值", "标准化得分")] = (
+            exploratory_pareto[column] / maximum if maximum > 0 else 0.0
+        )
+    pareto_value_cols = ["痰湿折外重要性标准化得分", "高血脂折外重要性标准化得分"]
+    exploratory_pareto["探索性Pareto候选"] = pareto_flags(exploratory_pareto[pareto_value_cols].to_numpy())
+    exploratory_pareto["证据性质"] = np.where(
+        exploratory_pareto["探索性Pareto候选"], "探索性候选（不得替代验证性入选）", "被其他候选支配"
+    )
+    pareto_map = exploratory_pareto.set_index("指标名称")["探索性Pareto候选"]
+    screen["探索性Pareto候选"] = screen["指标名称"].map(pareto_map).fillna(False).astype(bool)
     selected_phlegm = screen.loc[(screen["终点"] == "痰湿严重度") & screen["是否入选"], "指标名称"].tolist()
     selected_lipid = screen.loc[(screen["终点"] == "高血脂关联筛查") & screen["是否入选"], "指标名称"].tolist()
     shared = sorted(set(selected_phlegm).intersection(selected_lipid))
     screen.to_csv(OUTPUT_DIR / "question1_dual_endpoint_screening.csv", index=False, encoding="utf-8-sig")
+    exploratory_pareto.to_csv(OUTPUT_DIR / "question1_exploratory_pareto.csv", index=False, encoding="utf-8-sig")
     endpoint_performance = pd.DataFrame([
         {"终点": "痰湿严重度", "指标": "折外R²", "均值": np.mean(phlegm_scores), "标准差": np.std(phlegm_scores, ddof=1), "折数": len(phlegm_scores)},
         {"终点": "高血脂关联筛查", "指标": "折外AUC", "均值": np.mean(lipid_scores), "标准差": np.std(lipid_scores, ddof=1), "折数": len(lipid_scores)},
@@ -430,7 +502,24 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
             "未调整卡方P值": float(chi2_p),
         })
     constitution = pd.DataFrame(or_rows)
+    non_reference = constitution["体质标签"].ne(1)
+    constitution.loc[non_reference, "OR点估计名次"] = stats.rankdata(
+        -constitution.loc[non_reference, "调整OR"].to_numpy(float), method="average"
+    )
+    bootstrap_repeats = int(params["q1_constitution_bootstrap_repeats"])
+    rank_stability = stratified_constitution_rank_bootstrap(
+        df, y_lipid, covariates, bootstrap_repeats
+    )
+    constitution = constitution.merge(rank_stability, on="体质标签", how="left")
+    constitution["排名解释"] = np.where(
+        constitution["体质标签"].eq(1), "参照组，不参与偏颇体质排序",
+        "仅为探索性点估计排序；整体检验、置信区间与FDR优先"
+    )
     constitution.to_csv(OUTPUT_DIR / "question1_constitution_adjusted_or.csv", index=False, encoding="utf-8-sig")
+    rank_stability = rank_stability.merge(
+        constitution[["体质标签", "体质类型", "调整OR", "OR点估计名次"]], on="体质标签", how="left"
+    )
+    rank_stability.to_csv(OUTPUT_DIR / "question1_constitution_rank_stability.csv", index=False, encoding="utf-8-sig")
 
     sensitivity_rows: list[dict[str, Any]] = []
     sensitivity_p: list[float] = []
@@ -481,26 +570,31 @@ def run_problem1(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.set_ylabel("")
     save_figure(fig, "问题1_体质贡献度OR.pdf")
 
+    pareto_names = exploratory_pareto.loc[exploratory_pareto["探索性Pareto候选"], "指标名称"].tolist()
+    point_top = constitution.loc[constitution["OR点估计名次"].eq(1), "体质类型"].iloc[0]
     print(f"问题1：痰湿终点入选 {selected_phlegm}；非诊断高血脂关联入选 {selected_lipid}；共同指标 {shared}")
+    print(f"探索性Pareto候选 {pareto_names}；偏颇体质OR点估计首位 {point_top}（非显著排名）")
     print(f"九体质标签整体LR检验 P={global_p:.3g}，未调整卡方检验 P={chi2_p:.3g}")
     return {
         "screen": screen, "selected": shared, "selected_phlegm": selected_phlegm,
         "selected_lipid": selected_lipid, "shared": shared, "endpoint_performance": endpoint_performance,
         "constitution": constitution, "constitution_sensitivity": constitution_sensitivity,
+        "exploratory_pareto": exploratory_pareto, "constitution_rank_stability": rank_stability,
+        "constitution_bootstrap_repeats": bootstrap_repeats,
         "constitution_global_p": global_p, "constitution_chi2_p": float(chi2_p),
     }
 
 
 # ============================================================================
-# 第三部分：问题二——非血脂关联筛查与三级管理规则
+# 第三部分：问题二——非血脂关联筛查、统计三级分层与临床提示
 # ============================================================================
 
 
-def apply_management_rules(
+def apply_clinical_management_prompts(
     data: pd.DataFrame, phlegm_high: float = 60, phlegm_very_high: float = 80,
     activity_low: float = 40,
 ) -> pd.DataFrame:
-    """按题面阈值生成唯一管理等级，并记录全部触发规则。"""
+    """将题面示例转为独立临床提示，不参与统计风险等级计算。"""
     lipid_abnormal = data["任一血脂异常"].eq(1)
     phlegm_score = data["痰湿质积分"]
     low_activity = data["活动量表总分"].lt(activity_low)
@@ -531,21 +625,69 @@ def apply_management_rules(
             if bool(metabolic_abnormal.loc[idx]):
                 reasons.append("至少一项代谢异常")
         if not reasons:
-            reasons.append("未触发高危或中危规则")
+            reasons.append("未触发题面重点管理条件")
         triggers.append("；".join(reasons))
     return pd.DataFrame({
-        "诊断状态": np.where(lipid_abnormal, "血脂异常（当前已异常）", "血脂正常"),
-        "最终管理等级编码": code,
-        "最终管理等级": pd.Series(code).map({1: "低危", 2: "中危", 3: "高危"}).to_numpy(),
-        "触发规则": triggers,
+        "当前诊断状态": np.where(lipid_abnormal, "血脂异常（当前已异常）", "血脂正常"),
+        "临床管理提示编码": code,
+        "临床管理提示": pd.Series(code).map({1: "常规关注", 2: "重点管理", 3: "优先管理"}).to_numpy(),
+        "临床管理依据": triggers,
     }, index=data.index)
 
 
-def evaluate_management_tiers(
-    management: pd.DataFrame, y: np.ndarray, split: str,
-) -> pd.DataFrame:
+def derive_three_tier_cutpoints(
+    probability: np.ndarray, y: np.ndarray, min_fraction: float = 0.15,
+) -> tuple[tuple[float, float], pd.DataFrame]:
+    """仅用训练集折外概率搜索单调且各层样本充足的两个切点。"""
+    probability = np.asarray(probability, dtype=float)
+    y = np.asarray(y, dtype=int)
+    order = np.argsort(probability, kind="mergesort")
+    sorted_probability, sorted_y = probability[order], y[order]
+    n = len(y)
+    min_count = int(math.ceil(min_fraction * n))
+    cumulative = np.concatenate([[0], np.cumsum(sorted_y)])
+    overall = float(y.mean())
+    best: tuple[float, float, int, int, list[float]] | None = None
+    for first in range(min_count, n - 2 * min_count + 1):
+        if sorted_probability[first - 1] >= sorted_probability[first]:
+            continue
+        for second in range(first + min_count, n - min_count + 1):
+            if sorted_probability[second - 1] >= sorted_probability[second]:
+                continue
+            counts = [first, second - first, n - second]
+            positives = [
+                cumulative[first], cumulative[second] - cumulative[first], cumulative[n] - cumulative[second]
+            ]
+            rates = [float(p / c) for p, c in zip(positives, counts)]
+            if rates[0] > rates[1] + 1e-12 or rates[1] > rates[2] + 1e-12:
+                continue
+            objective = float(sum(c * (rate - overall) ** 2 for c, rate in zip(counts, rates)) / n)
+            separation = float(min(rates[1] - rates[0], rates[2] - rates[1]))
+            candidate = (objective, separation, first, second, rates)
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    if best is None:
+        raise RuntimeError("训练集折外概率无法形成满足样本比例和单调性约束的三级切点")
+    objective, separation, first, second, rates = best
+    low = float((sorted_probability[first - 1] + sorted_probability[first]) / 2)
+    high = float((sorted_probability[second - 1] + sorted_probability[second]) / 2)
+    details = pd.DataFrame([{
+        "阈值来源": "训练集折外概率", "低中切点": low, "中高切点": high,
+        "最小层样本比例约束": min_fraction, "层间方差目标值": objective,
+        "最小相邻患病率差": separation, "训练样本数": n,
+        "训练低层患病率": rates[0], "训练中层患病率": rates[1], "训练高层患病率": rates[2],
+        "训练低层人数": first, "训练中层人数": second - first, "训练高层人数": n - second,
+    }])
+    return (low, high), details
+
+
+def statistical_tier_codes(probability: np.ndarray, thresholds: tuple[float, float]) -> np.ndarray:
+    return np.digitize(np.asarray(probability, dtype=float), thresholds, right=False) + 1
+
+
+def evaluate_risk_tiers(code: np.ndarray, y: np.ndarray, split: str) -> pd.DataFrame:
     names = {1: "低危", 2: "中危", 3: "高危"}
-    code = management["最终管理等级编码"].to_numpy(int)
+    code = np.asarray(code, dtype=int)
     rows = []
     for level in (1, 2, 3):
         mask = code == level
@@ -563,11 +705,49 @@ def evaluate_management_tiers(
     return pd.DataFrame(rows)
 
 
-def enumerate_phlegm_combinations(test_df: pd.DataFrame, management_code: np.ndarray) -> pd.DataFrame:
+def cart_path_strings(model: DecisionTreeClassifier, data: pd.DataFrame) -> list[str]:
+    tree = model.tree_
+    paths: list[str] = []
+    matrix = data.to_numpy(float)
+    for row in matrix:
+        node = 0
+        rules: list[str] = []
+        while tree.children_left[node] != tree.children_right[node]:
+            feature = data.columns[tree.feature[node]]
+            threshold = float(tree.threshold[node])
+            if row[tree.feature[node]] <= threshold:
+                rules.append(f"{feature}≤{threshold:.3f}")
+                node = int(tree.children_left[node])
+            else:
+                rules.append(f"{feature}>{threshold:.3f}")
+                node = int(tree.children_right[node])
+        paths.append(" 且 ".join(rules) + f" → 叶节点{node}")
+    return paths
+
+
+def extract_cart_leaf_rules(
+    model: DecisionTreeClassifier, data: pd.DataFrame, y: np.ndarray,
+) -> pd.DataFrame:
+    leaf_ids = model.apply(data)
+    path_strings = cart_path_strings(model, data)
+    predicted = model.predict(data).astype(int)
+    rows: list[dict[str, Any]] = []
+    for leaf in np.unique(leaf_ids):
+        mask = leaf_ids == leaf
+        first = int(np.flatnonzero(mask)[0])
+        rows.append({
+            "叶节点": int(leaf), "叶节点规则": path_strings[first],
+            "代理风险等级编码": int(predicted[first]),
+            "代理风险等级": {1: "低危", 2: "中危", 3: "高危"}[int(predicted[first])],
+            "训练样本数": int(mask.sum()), "训练观察患病率": float(np.asarray(y)[mask].mean()),
+        })
+    return pd.DataFrame(rows).sort_values("叶节点").reset_index(drop=True)
+
+
+def enumerate_phlegm_combinations(test_df: pd.DataFrame, statistical_code: np.ndarray) -> pd.DataFrame:
     work = test_df.copy()
-    work["高危"] = management_code == 3
+    work["高危"] = statistical_code == 3
     conditions = {
-        "血脂异常": work["任一血脂异常"].eq(1),
         "痰湿积分≥60": work["痰湿质积分"] >= 60,
         "活动总分<40": work["活动量表总分"] < 40,
         "BMI异常": work["BMI异常"].eq(1),
@@ -634,6 +814,10 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
             n_estimators=240, min_samples_leaf=8, max_features="sqrt",
             class_weight="balanced_subsample", random_state=RANDOM_STATE, n_jobs=-1,
         ),
+        "浅层CART": DecisionTreeClassifier(
+            max_depth=3, min_samples_leaf=0.10, max_leaf_nodes=6,
+            class_weight="balanced", random_state=RANDOM_STATE,
+        ),
     }
     candidate_rows = []
     for name, estimator in candidates.items():
@@ -642,14 +826,69 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     candidate_df = pd.DataFrame(candidate_rows).sort_values("训练集CV_AUC均值", ascending=False).reset_index(drop=True)
     best_name = str(candidate_df.iloc[0]["模型"])
     best_base = clone(candidates[best_name])
+
+    # 训练集外层五折、内层三折校准，所得概率仅用于训练内选择三级切点。
+    oof_probability = np.empty(len(train_idx), dtype=float)
+    outer_cv = StratifiedKFold(5, shuffle=True, random_state=RANDOM_STATE + 11)
+    for fold, (inner_train, validation) in enumerate(outer_cv.split(X_train, y_train), start=1):
+        inner_cv = StratifiedKFold(3, shuffle=True, random_state=RANDOM_STATE + 100 + fold)
+        fold_model = CalibratedClassifierCV(clone(best_base), method="sigmoid", cv=inner_cv)
+        fold_model.fit(X_train.iloc[inner_train], y_train[inner_train])
+        oof_probability[validation] = fold_model.predict_proba(X_train.iloc[validation])[:, 1]
+    thresholds, threshold_selection = derive_three_tier_cutpoints(
+        oof_probability, y_train, float(params["q2_min_tier_fraction"])
+    )
+    train_statistical_code = statistical_tier_codes(oof_probability, thresholds)
+
     calibrated = CalibratedClassifierCV(best_base, method="sigmoid", cv=5)
     calibrated.fit(X_train, y_train)
     test_prob = calibrated.predict_proba(X_test)[:, 1]
-    management_all = apply_management_rules(df)
-    management_test = management_all.iloc[test_idx]
-    test_tiers = evaluate_management_tiers(management_test, y_test, "独立测试集")
-    full_tiers = evaluate_management_tiers(management_all, y, "全体样本")
-    management_code = management_test["最终管理等级编码"].to_numpy(int)
+    test_statistical_code = statistical_tier_codes(test_prob, thresholds)
+    all_probability = np.empty(len(df), dtype=float)
+    all_probability[train_idx] = oof_probability
+    all_probability[test_idx] = test_prob
+    all_statistical_code = statistical_tier_codes(all_probability, thresholds)
+    test_tiers = evaluate_risk_tiers(test_statistical_code, y_test, "独立测试集")
+    full_tiers = evaluate_risk_tiers(all_statistical_code, y, "全体样本（训练折外+独立测试）")
+
+    # CART 只作为统计风险等级的代理解释器，模型参数由训练集交叉验证选择。
+    surrogate_rows: list[dict[str, Any]] = []
+    surrogate_cv = StratifiedKFold(5, shuffle=True, random_state=RANDOM_STATE + 17)
+    for depth in (2, 3, 4):
+        for min_leaf in (0.05, 0.10):
+            estimator = DecisionTreeClassifier(
+                max_depth=depth, min_samples_leaf=min_leaf, max_leaf_nodes=6,
+                class_weight="balanced", random_state=RANDOM_STATE,
+            )
+            f1_scores = cross_val_score(
+                estimator, X_train, train_statistical_code, cv=surrogate_cv, scoring="f1_macro"
+            )
+            fidelity_scores = cross_val_score(
+                estimator, X_train, train_statistical_code, cv=surrogate_cv, scoring="accuracy"
+            )
+            surrogate_rows.append({
+                "最大深度": depth, "最小叶节点比例": min_leaf, "最大叶节点数": 6,
+                "CV宏平均F1": float(f1_scores.mean()), "CV宏平均F1标准差": float(f1_scores.std(ddof=1)),
+                "CV一致率": float(fidelity_scores.mean()), "CV一致率标准差": float(fidelity_scores.std(ddof=1)),
+            })
+    surrogate_candidates = pd.DataFrame(surrogate_rows).sort_values(
+        ["CV宏平均F1", "CV一致率", "最大深度"], ascending=[False, False, True]
+    ).reset_index(drop=True)
+    selected_surrogate = surrogate_candidates.iloc[0]
+    cart_surrogate = DecisionTreeClassifier(
+        max_depth=int(selected_surrogate["最大深度"]),
+        min_samples_leaf=float(selected_surrogate["最小叶节点比例"]),
+        max_leaf_nodes=6, class_weight="balanced", random_state=RANDOM_STATE,
+    )
+    cart_surrogate.fit(X_train, train_statistical_code)
+    train_cart_code = cart_surrogate.predict(X_train).astype(int)
+    test_cart_code = cart_surrogate.predict(X_test).astype(int)
+    all_cart_code = cart_surrogate.predict(X).astype(int)
+    cart_rules = extract_cart_leaf_rules(cart_surrogate, X_train, y_train)
+    cart_paths_all = cart_path_strings(cart_surrogate, X)
+
+    clinical_all = apply_clinical_management_prompts(df)
+    clinical_test = clinical_all.iloc[test_idx]
 
     pred_binary = (test_prob >= 0.5).astype(int)
     metrics = {
@@ -664,15 +903,23 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         "test_probability_max": float(test_prob.max()),
         "diagnostic_rule_agreement": float((df["高血脂症标签"] == df["任一血脂异常"]).mean()),
         "model_features": features,
-        "management_rule_phlegm_high": 60,
-        "management_rule_phlegm_very_high": 80,
-        "management_rule_activity_low": 40,
+        "statistical_tier_cutpoints": list(thresholds),
+        "threshold_selection_dataset": "训练集折外概率",
+        "threshold_min_tier_fraction": float(params["q2_min_tier_fraction"]),
+        "training_oof_auc": float(roc_auc_score(y_train, oof_probability)),
+        "cart_surrogate_max_depth": int(selected_surrogate["最大深度"]),
+        "cart_surrogate_min_leaf_fraction": float(selected_surrogate["最小叶节点比例"]),
+        "cart_surrogate_cv_macro_f1": float(selected_surrogate["CV宏平均F1"]),
+        "cart_surrogate_cv_fidelity": float(selected_surrogate["CV一致率"]),
+        "cart_surrogate_train_fidelity": float(accuracy_score(train_statistical_code, train_cart_code)),
+        "cart_surrogate_test_fidelity": float(accuracy_score(test_statistical_code, test_cart_code)),
         "prospective_outcome_available": False,
-        "management_tier_is_rule_based": True,
+        "statistical_tier_is_rule_based": False,
+        "clinical_prompt_is_separate": True,
     }
     tn, fp, fn, tp = confusion_matrix(y_test, pred_binary, labels=[0, 1]).ravel()
     metrics.update({"tn_at_0.5": int(tn), "fp_at_0.5": int(fp), "fn_at_0.5": int(fn), "tp_at_0.5": int(tp)})
-    tier_masks = {level: management_code == level for level in (1, 2, 3)}
+    tier_masks = {level: test_statistical_code == level for level in (1, 2, 3)}
     def tier_fisher(a: int, b: int) -> float:
         ma, mb = tier_masks[a], tier_masks[b]
         table = [
@@ -681,28 +928,9 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         ]
         return float(stats.fisher_exact(table).pvalue)
     metrics.update({
-        "fisher_p_low_vs_medium_management": tier_fisher(1, 2),
-        "fisher_p_medium_vs_high_management": tier_fisher(2, 3),
+        "fisher_p_low_vs_medium_statistical": tier_fisher(1, 2),
+        "fisher_p_medium_vs_high_statistical": tier_fisher(2, 3),
     })
-
-    # 固定临床阈值的局部敏感性，而非重新寻找概率切点。
-    rule_scenarios = [
-        ("基准", 60, 80, 40), ("痰湿高阈值-5", 55, 80, 40), ("痰湿高阈值+5", 65, 80, 40),
-        ("痰湿极高阈值-5", 60, 75, 40), ("痰湿极高阈值+5", 60, 85, 40),
-        ("低活动阈值-5", 60, 80, 35), ("低活动阈值+5", 60, 80, 45),
-    ]
-    sensitivity_rows: list[dict[str, Any]] = []
-    test_frame = df.iloc[test_idx]
-    for scenario, s_high, s_very_high, a_low in rule_scenarios:
-        scenario_management = apply_management_rules(test_frame, s_high, s_very_high, a_low)
-        scenario_tiers = evaluate_management_tiers(scenario_management, y_test, scenario)
-        for _, row in scenario_tiers.iterrows():
-            sensitivity_rows.append({
-                "场景": scenario, "痰湿高阈值": s_high, "痰湿极高阈值": s_very_high,
-                "低活动阈值": a_low, "风险等级": row["风险等级"], "人数": int(row["人数"]),
-                "占比": float(row["占比"]), "实际患病率": float(row["实际患病率"]),
-            })
-    rule_sensitivity = pd.DataFrame(sensitivity_rows)
 
     # 置换重要性只在独立测试集计算。
     perm = permutation_importance(calibrated, X_test, y_test, scoring="roc_auc", n_repeats=20, random_state=RANDOM_STATE, n_jobs=-1)
@@ -714,34 +942,45 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
 
     # 各层特征画像。
     test_profile = df.iloc[test_idx].copy()
-    test_profile["风险等级编码"] = management_code
+    test_profile["风险等级编码"] = test_statistical_code
     profile_cols = ["痰湿质积分", "活动量表总分", "BMI", "血糖", "血尿酸", "年龄组"]
     profile = test_profile.groupby("风险等级编码")[profile_cols].agg(["median", "mean"]).round(3)
     profile.columns = [f"{a}_{b}" for a, b in profile.columns]
     profile = profile.reset_index()
     profile["风险等级"] = profile["风险等级编码"].map({1: "低危", 2: "中危", 3: "高危"})
-    rule_text = {
-        1: "未触发高危或中危规则",
-        2: "非高危，且存在血脂异常/痰湿积分≥60/活动总分<40/至少一项代谢异常",
-        3: "血脂异常且痰湿积分≥60；或血脂正常、痰湿积分≥80且活动总分<40；或痰湿质、痰湿积分≥60且尿酸异常",
+    statistical_rule_text = {
+        1: f"非血脂筛查概率 < {thresholds[0]:.4f}",
+        2: f"{thresholds[0]:.4f} ≤ 非血脂筛查概率 < {thresholds[1]:.4f}",
+        3: f"非血脂筛查概率 ≥ {thresholds[1]:.4f}",
     }
-    profile["特征分层规则"] = profile["风险等级编码"].map(rule_text)
+    profile["统计分层规则"] = profile["风险等级编码"].map(statistical_rule_text)
 
-    combinations = enumerate_phlegm_combinations(test_profile, management_code)
+    combinations = enumerate_phlegm_combinations(test_profile, test_statistical_code)
 
-    # 保存患者级结果与规则。
-    predictions = df.iloc[test_idx][["样本ID", "体质标签"] + features].copy()
-    predictions["真实标签"] = y_test
-    predictions["诊断状态"] = management_test["诊断状态"].to_numpy()
-    predictions["非血脂筛查概率"] = test_prob
-    predictions["最终管理等级编码"] = management_code
-    predictions["最终管理等级"] = management_test["最终管理等级"].to_numpy()
-    predictions["触发规则"] = management_test["触发规则"].to_numpy()
+    # 患者级结果：统计风险、CART解释和临床提示三种口径严格分列。
+    patient_results = df[["样本ID", "体质标签"] + features].copy()
+    patient_results["真实标签"] = y
+    patient_results["当前诊断状态"] = clinical_all["当前诊断状态"].to_numpy()
+    patient_results["非血脂筛查概率"] = all_probability
+    patient_results["概率来源"] = "训练集折外"
+    patient_results.loc[test_idx, "概率来源"] = "独立测试集"
+    patient_results["统计风险等级编码"] = all_statistical_code
+    patient_results["统计风险等级"] = pd.Series(all_statistical_code).map({1: "低危", 2: "中危", 3: "高危"}).to_numpy()
+    patient_results["概率切点依据"] = patient_results["统计风险等级编码"].map(statistical_rule_text)
+    patient_results["CART代理风险等级编码"] = all_cart_code
+    patient_results["CART代理风险等级"] = pd.Series(all_cart_code).map({1: "低危", 2: "中危", 3: "高危"}).to_numpy()
+    patient_results["CART代理路径"] = cart_paths_all
+    patient_results["临床管理提示"] = clinical_all["临床管理提示"].to_numpy()
+    patient_results["临床管理依据"] = clinical_all["临床管理依据"].to_numpy()
+    predictions = patient_results.iloc[test_idx].copy()
     all_tiers = pd.concat([full_tiers, test_tiers], ignore_index=True, sort=False)
     candidate_df.to_csv(OUTPUT_DIR / "question2_candidate_models.csv", index=False, encoding="utf-8-sig")
     all_tiers.to_csv(OUTPUT_DIR / "question2_risk_tiers.csv", index=False, encoding="utf-8-sig")
+    threshold_selection.to_csv(OUTPUT_DIR / "question2_threshold_selection.csv", index=False, encoding="utf-8-sig")
+    surrogate_candidates.to_csv(OUTPUT_DIR / "question2_cart_surrogate_candidates.csv", index=False, encoding="utf-8-sig")
+    cart_rules.to_csv(OUTPUT_DIR / "question2_cart_rules.csv", index=False, encoding="utf-8-sig")
     (OUTPUT_DIR / "question2_threshold_bootstrap.csv").unlink(missing_ok=True)
-    rule_sensitivity.to_csv(OUTPUT_DIR / "question2_rule_sensitivity.csv", index=False, encoding="utf-8-sig")
+    (OUTPUT_DIR / "question2_rule_sensitivity.csv").unlink(missing_ok=True)
     pd.DataFrame(
         [[tn, fp], [fn, tp]], index=["真实阴性", "真实阳性"], columns=["预测阴性", "预测阳性"]
     ).to_csv(OUTPUT_DIR / "question2_binary_confusion_matrix.csv", encoding="utf-8-sig")
@@ -749,6 +988,7 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     profile.to_csv(OUTPUT_DIR / "question2_feature_layers.csv", index=False, encoding="utf-8-sig")
     combinations.to_csv(OUTPUT_DIR / "question2_phlegm_core_combinations.csv", index=False, encoding="utf-8-sig")
     predictions.to_csv(OUTPUT_DIR / "question2_test_predictions.csv", index=False, encoding="utf-8-sig")
+    patient_results.to_csv(OUTPUT_DIR / "question2_patient_results.csv", index=False, encoding="utf-8-sig")
     write_json(OUTPUT_DIR / "question2_metrics.json", metrics)
 
     # ROC。
@@ -761,7 +1001,7 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax.legend(frameon=False, loc="lower right")
     save_figure(fig, "问题2_筛查模型ROC.pdf")
 
-    # 三级管理优先级分布与当前异常率。
+    # 训练内定阈后的独立测试集三级筛查分数层级。
     fig, ax1 = plt.subplots(figsize=(7.2, 5.3))
     colors = ["#59A14F", "#F2CF5B", "#E15759"]
     x = np.arange(3)
@@ -788,15 +1028,19 @@ def run_problem2(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
 
     rates = test_tiers["实际患病率"].tolist()
     print(f"问题2：选用 {best_name}，独立测试 AUC={metrics['auc']:.3f}，Brier={metrics['brier']:.3f}")
-    print(f"测试集低/中/高管理人数：{test_tiers['人数'].tolist()}；当前异常率：{[round(x, 3) for x in rates]}")
+    print(f"训练折外概率切点：{thresholds[0]:.4f}, {thresholds[1]:.4f}")
+    print(f"测试集低/中/高统计层人数：{test_tiers['人数'].tolist()}；当前异常率：{[round(x, 3) for x in rates]}")
+    print(f"CART代理测试一致率：{metrics['cart_surrogate_test_fidelity']:.3f}")
     if not combinations.empty:
         print("痰湿体质高危核心组合首位：" + str(combinations.iloc[0]["核心特征组合"]))
     return {
         "model": calibrated, "metrics": metrics, "candidate_models": candidate_df,
         "tiers": all_tiers, "test_tiers": test_tiers, "feature_importance": feature_importance,
         "profile": profile, "combinations": combinations, "test_predictions": predictions,
-        "management_all": management_all, "management_test": management_test,
-        "rule_sensitivity": rule_sensitivity,
+        "patient_results": patient_results, "thresholds": thresholds,
+        "threshold_selection": threshold_selection, "cart_surrogate": cart_surrogate,
+        "cart_surrogate_candidates": surrogate_candidates, "cart_rules": cart_rules,
+        "clinical_all": clinical_all, "clinical_test": clinical_test,
         "train_idx": train_idx, "test_idx": test_idx,
     }
 
@@ -994,6 +1238,16 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
         raise ValueError("附件样本 ID 1/2/3 不完整或不属于痰湿质")
     plan_123 = pd.concat([sample_plans[i] for i in (1, 2, 3)], ignore_index=True)
     pareto_123 = pd.concat([sample_paretos[i] for i in (1, 2, 3)], ignore_index=True)
+    selected_on_frontier: dict[int, bool] = {}
+    for sample_id in (1, 2, 3):
+        chosen = summary.loc[summary["样本ID"].eq(sample_id)].iloc[0]
+        frontier = pareto_123[pareto_123["样本ID"].eq(sample_id)]
+        selected_on_frontier[sample_id] = bool((
+            np.isclose(frontier["总成本"], chosen["六个月总成本"])
+            & np.isclose(frontier["最终积分"], chosen["最终痰湿积分"])
+        ).any())
+    if not all(selected_on_frontier.values()):
+        raise AssertionError(f"样本1—3推荐点并非全部位于Pareto前沿：{selected_on_frontier}")
 
     # 患者特征—最优方案匹配规律。
     matching_rows = []
@@ -1046,6 +1300,7 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     write_json(OUTPUT_DIR / "question3_constraint_checks.json", {
         "patient_count": len(summary), "all_plans_feasible": bool(all(all_checks)),
         "budget_limit": int(params["q3_max_cost"]), "target_effect_ratio": float(params["q3_target_effect_ratio"]),
+        "selected_points_on_pareto_frontier": selected_on_frontier,
     })
 
     # ID 1/2/3 积分曲线。
@@ -1077,6 +1332,35 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     ax1.legend(handles1 + handles2, labels1 + labels2, frameon=False, loc="upper left")
     save_figure(fig, "问题3_成本效果对比.pdf")
 
+    # 成本—积分降幅 Pareto 前沿，并标记 ε-约束最终选择点。
+    fig, ax = plt.subplots(figsize=(8.4, 5.6))
+    colors = {1: "#4C78A8", 2: "#F28E2B", 3: "#59A14F"}
+    markers = {1: "o", 2: "s", 3: "^"}
+    for sample_id in (1, 2, 3):
+        frontier = pareto_123[pareto_123["样本ID"].eq(sample_id)].sort_values("总成本")
+        ax.plot(
+            frontier["总成本"], frontier["降低分数"], color=colors[sample_id],
+            linewidth=1.8, marker=markers[sample_id], markersize=3.5, label=f"样本{sample_id} Pareto前沿",
+        )
+        chosen = sample_summary[sample_summary["样本ID"].eq(sample_id)].iloc[0]
+        ax.scatter(
+            chosen["六个月总成本"], chosen["降低分数"], s=150, marker="*",
+            color=colors[sample_id], edgecolor="black", linewidth=0.8, zorder=5,
+        )
+        ax.annotate(
+            f"样本{sample_id}选择点\n{chosen['六个月总成本']:.0f}元，降{chosen['降低分数']:.1f}分",
+            (chosen["六个月总成本"], chosen["降低分数"]), xytext=(6, 6),
+            textcoords="offset points", fontsize=8, color=colors[sample_id],
+        )
+    ax.set_xlabel("六个月总成本（元）")
+    ax.set_ylabel("痰湿积分降低值")
+    ax.legend(frameon=False, loc="upper left")
+    ax.text(
+        0.99, 0.02, "★：达到最大可降幅90%以上后的最低成本方案",
+        transform=ax.transAxes, ha="right", va="bottom", fontsize=9,
+    )
+    save_figure(fig, "问题3_成本降幅Pareto前沿.pdf")
+
     print(f"问题3：已对全部 {len(summary)} 名痰湿质患者求解，约束回代全部通过={all(all_checks)}")
     for sample_id in (1, 2, 3):
         row = summary[summary["样本ID"].eq(sample_id)].iloc[0]
@@ -1087,6 +1371,7 @@ def run_problem3(df: pd.DataFrame, params: dict[str, Any] = PARAMS) -> dict[str,
     return {
         "summary": summary, "plans_123": plan_123, "pareto_123": pareto_123,
         "matching": matching, "sensitivity": sensitivity,
+        "selected_on_frontier": selected_on_frontier,
         "all_plans_feasible": bool(all(all_checks)),
     }
 
@@ -1104,6 +1389,10 @@ def write_results_report(
     q1_phlegm_perf = q1["endpoint_performance"].loc[q1["endpoint_performance"]["终点"].eq("痰湿严重度")].iloc[0]
     q1_lipid_perf = q1["endpoint_performance"].loc[q1["endpoint_performance"]["终点"].eq("高血脂关联筛查")].iloc[0]
     q1_phlegm_or = q1["constitution"].loc[q1["constitution"]["体质标签"].eq(5)].iloc[0]
+    q1_point_top = q1["constitution"].loc[q1["constitution"]["OR点估计名次"].eq(1)].iloc[0]
+    q1_pareto_names = q1["exploratory_pareto"].loc[
+        q1["exploratory_pareto"]["探索性Pareto候选"], "指标名称"
+    ].tolist()
     combo_text = "无满足最小支持度的组合"
     if not q2["combinations"].empty:
         combo = q2["combinations"].iloc[0]
@@ -1133,16 +1422,18 @@ def write_results_report(
         f"痰湿严重度模型的15折重复交叉验证平均 R²={q1_phlegm_perf['均值']:.3f}，说明附件中的血液与活动指标不具备可靠的折外痰湿积分解释能力；该终点没有指标通过折外重要性、相关强度和FDR联合门槛。",
         f"高血脂关联筛查严格排除TC、TG、LDL-C、HDL-C及其异常派生量，非诊断模型平均折外 AUC={q1_lipid_perf['均值']:.3f}；通过门槛的指标为 {q1['selected_lipid']}。",
         f"两终点共同关键指标为 {q1['shared']}。交集为空时不强制选出指标，因此不再把TC、TG的诊断同义复现表述为风险发现。",
+        f"探索性多目标比较得到 Pareto 候选 {q1_pareto_names}，仅用于提示后续研究方向，不能替代验证性入选结论。",
         f"九体质主分析以体质标签为分类暴露、平和质为参照，调整年龄、性别、烟酒、BMI、活动总分、血糖和血尿酸后，整体似然比检验 P={q1['constitution_global_p']:.3f}。",
-        f"痰湿质相对平和质的调整 OR={q1_phlegm_or['调整OR']:.3f}，95%CI [{q1_phlegm_or['95%CI下限']:.3f}, {q1_phlegm_or['95%CI上限']:.3f}]，P={q1_phlegm_or['P值']:.3f}，FDR q={q1_phlegm_or['FDR_q值']:.3f}。数据不支持九体质贡献存在显著差异，也不再对不显著点估计作贡献排名。",
+        f"痰湿质相对平和质的调整 OR={q1_phlegm_or['调整OR']:.3f}，95%CI [{q1_phlegm_or['95%CI下限']:.3f}, {q1_phlegm_or['95%CI上限']:.3f}]，P={q1_phlegm_or['P值']:.3f}，FDR q={q1_phlegm_or['FDR_q值']:.3f}。探索性点估计中{q1_point_top['体质类型']}居首（OR={q1_point_top['调整OR']:.3f}），其500次分层Bootstrap首位频率为{q1_point_top['位居首位频率']:.1%}；整体检验与区间证据仍不支持显著贡献首位。",
         "",
         "## 问题二结果",
         "",
         f"非血脂关联模型仅使用体质、活动、代谢和基础信息，训练集比较后选用 {q2['metrics']['selected_model']}；其独立测试 AUC={q2['metrics']['auc']:.3f}、AP={q2['metrics']['average_precision']:.3f}、Brier={q2['metrics']['brier']:.3f}。",
         "该概率只表示与当前血脂异常的横断面关联筛查分数。附件没有随访结局，不能将其解释为未来发病概率。",
-        "最终管理等级不再由概率切点定义，而由题面可追溯特征规则确定：高危为“血脂异常且痰湿积分≥60”，或“血脂正常、痰湿积分≥80且活动总分<40”，或“痰湿质、痰湿积分≥60且尿酸异常”；中危为未满足高危但存在血脂异常、痰湿积分≥60、活动总分<40或至少一项代谢异常；其余为低危。",
-        f"独立测试集中低危与中危 Fisher 检验 P={q2['metrics']['fisher_p_low_vs_medium_management']:.3g}，中危与高危 P={q2['metrics']['fisher_p_medium_vs_high_management']:.3g}。三级结果是管理优先级，当前异常率仅用于横断面一致性检查。",
-        "测试集三级管理结果：",
+        f"两个概率切点 {q2['thresholds'][0]:.4f} 与 {q2['thresholds'][1]:.4f} 仅由训练集折外概率搜索确定，并约束每层不少于训练样本的{PARAMS['q2_min_tier_fraction']:.0%}且患病率单调。独立测试集不参与模型或阈值选择。",
+        f"浅层CART作为解释代理，最大深度{q2['metrics']['cart_surrogate_max_depth']}、最小叶节点比例{q2['metrics']['cart_surrogate_min_leaf_fraction']:.0%}；训练交叉验证宏平均F1={q2['metrics']['cart_surrogate_cv_macro_f1']:.3f}，测试集与统计层级一致率={q2['metrics']['cart_surrogate_test_fidelity']:.3f}。题面示例规则另列为临床管理提示。",
+        f"独立测试集中低危与中危 Fisher 检验 P={q2['metrics']['fisher_p_low_vs_medium_statistical']:.3g}，中危与高危 P={q2['metrics']['fisher_p_medium_vs_high_statistical']:.3g}。三级仅称为筛查分数层级，不视为已前瞻验证的未来风险群。",
+        "测试集三级筛查分数层级：",
         "",
         "|风险等级|人数|占比|实际患病率|95%CI|",
         "|---|---:|---:|---:|---:|",
@@ -1154,12 +1445,13 @@ def write_results_report(
         )
     lines += [
         "",
-        f"相对于最终管理高危层，痰湿体质核心组合首位为：{combo_text}。",
-        "患者级结果同时保留诊断状态、非血脂筛查概率、唯一最终管理等级和触发规则，不再存在模型等级与临床规则相互矛盾的双重输出。",
+        f"相对于统计高危层，排除诊断血脂后的痰湿体质核心组合首位为：{combo_text}。",
+        "患者级结果分列当前诊断状态、非血脂筛查概率、唯一统计风险等级、CART代理路径和临床管理提示，避免把不同用途的结果混为同一口径。",
         "",
         "## 问题三结果",
         "",
         f"对附件中全部 {len(q3['summary'])} 名体质标签 5 患者完成动态规划。推荐方案采用 ε-约束：先求预算内最大可降幅，再选择达到其 {PARAMS['q3_target_effect_ratio']:.0%} 以上且成本最低的方案。",
+        "样本1—3的最终推荐点均位于对应成本—积分降幅 Pareto 前沿，图中以星形标记。",
         "题目未给中医调理方式的独立疗效参数，基准模型只把其作为随积分分层的必选成本；额外疗效 0%/1%/2% 已作为敏感性场景而非基准事实。",
         "",
         "|样本ID|真实初始积分|年龄组|活动总分|最终积分|降低分数|总成本|最大允许强度|",
@@ -1176,14 +1468,14 @@ def write_results_report(
         "",
         "## 灵敏度分析",
         "",
-        "问题二对痰湿高阈值、痰湿极高阈值和低活动阈值分别上下扰动5分；问题三分别扰动积分步长、活动效果、预算上限和调理额外月降幅。",
-        "所有场景保留在 `results/question2_rule_sensitivity.csv` 与 `results/question3_sensitivity.csv`。",
+        "问题二报告训练集折外概率切点、CART参数交叉验证和独立测试层级表现；问题三分别扰动积分步长、活动效果、预算上限和调理额外月降幅。",
+        "问题二阈值依据保留在 `results/question2_threshold_selection.csv`，问题三场景保留在 `results/question3_sensitivity.csv`。",
         "",
         "## 约束与一致性校验",
         "",
         "- 问题一允许共同指标为空；四项诊断血脂不会进入高血脂关联筛查模型。",
-        "- 问题二模型不含诊断血脂及其派生变量；每名患者只输出一个可追溯管理等级。",
-        "- 问题三逐月回代年龄、活动评分、频率、预算与积分单调约束；全部患者通过。",
+        "- 问题二模型不含诊断血脂及其派生变量；每名患者只输出一个统计风险等级，临床管理提示独立保存。",
+        "- 问题三逐月回代年龄、活动评分、频率、预算与积分单调约束；全部患者通过，样本1—3选择点均在Pareto前沿。",
         "- ID 1/2/3 均直接按附件样本 ID 读取，不再手工构造患者参数。",
         "- 所有论文引用数值均保存为 CSV/JSON，图表统一输出论文用矢量 PDF。",
         "",
@@ -1213,10 +1505,15 @@ def build_run_summary(
         "question1_endpoint_performance": q1["endpoint_performance"].to_dict(orient="records"),
         "question1_constitution_global_p": q1["constitution_global_p"],
         "question1_phlegm_constitution_or": q1["constitution"].loc[q1["constitution"]["体质标签"].eq(5)].iloc[0].to_dict(),
+        "question1_exploratory_pareto": q1["exploratory_pareto"].to_dict(orient="records"),
+        "question1_constitution_rank_stability": q1["constitution_rank_stability"].to_dict(orient="records"),
         "question2_metrics": q2["metrics"],
+        "question2_threshold_selection": q2["threshold_selection"].to_dict(orient="records"),
+        "question2_cart_rules": q2["cart_rules"].to_dict(orient="records"),
         "question2_test_tiers": q2["test_tiers"].to_dict(orient="records"),
         "question3_samples": q3["summary"][q3["summary"]["样本ID"].isin([1, 2, 3])].to_dict(orient="records"),
         "question3_all_feasible": True,
+        "question3_selected_on_frontier": q3["selected_on_frontier"],
     }
 
 
@@ -1260,9 +1557,17 @@ def validate_results(
     assert constitution.loc[constitution["体质标签"].eq(1), "调整OR"].iloc[0] == 1.0
     assert constitution.loc[constitution["体质标签"].ne(1), "FDR_q值"].between(0, 1).all()
     assert constitution["整体LR检验P值"].nunique() == 1
-    checks.append("问题一：泄漏排除、折外筛选、FDR及分类体质OR通过")
+    assert q1["exploratory_pareto"]["探索性Pareto候选"].any()
+    assert constitution.loc[constitution["体质标签"].ne(1), "OR点估计名次"].notna().all()
+    assert constitution.loc[constitution["体质标签"].ne(1), "Bootstrap中位名次"].notna().all()
+    assert np.isclose(
+        constitution.loc[constitution["体质标签"].ne(1), "位居首位频率"].sum(), 1.0, atol=1e-9
+    )
+    assert int(q1["constitution_bootstrap_repeats"]) == 500
+    assert not set(q1["exploratory_pareto"]["指标名称"]) & diagnostic_features
+    checks.append("问题一：泄漏排除、折外筛选、探索性Pareto及体质Bootstrap排名通过")
 
-    # 问题二：模型特征无诊断血脂；按患者原始字段重新生成唯一管理等级与触发规则。
+    # 问题二：模型特征无诊断血脂；训练内定切点并把统计等级与临床提示分列。
     leakage_tokens = (
         "总胆固醇", "甘油三酯", "低密度脂蛋白", "高密度脂蛋白",
         "TC异常", "TG异常", "LDL异常", "HDL异常", "任一血脂异常",
@@ -1270,49 +1575,30 @@ def validate_results(
     model_features = q2["metrics"]["model_features"]
     assert all(not any(token in feature for token in leakage_tokens) for feature in model_features)
     assert np.isclose(q2["metrics"]["auc"], 0.8211574953, atol=2e-6)
-    assert q2["test_tiers"].sort_values("风险等级编码")["人数"].astype(int).tolist() == [21, 247, 32]
+    assert q2["metrics"]["threshold_selection_dataset"] == "训练集折外概率"
+    assert not q2["metrics"]["statistical_tier_is_rule_based"]
+    assert q2["metrics"]["clinical_prompt_is_separate"]
+    assert len(q2["thresholds"]) == 2 and q2["thresholds"][0] < q2["thresholds"][1]
+    assert q2["test_tiers"]["人数"].min() > 0
+    assert np.all(np.diff(q2["test_tiers"].sort_values("风险等级编码")["实际患病率"]) >= -1e-12)
 
-    test_frame = df.iloc[q2["test_idx"]]
-    lipid_abnormal = test_frame["任一血脂异常"].eq(1)
-    phlegm_score = test_frame["痰湿质积分"]
-    low_activity = test_frame["活动量表总分"].lt(40)
-    metabolic_abnormal = test_frame[["尿酸异常", "BMI异常", "血糖异常"]].max(axis=1).eq(1)
-    high_rule_1 = lipid_abnormal & phlegm_score.ge(60)
-    high_rule_2 = (~lipid_abnormal) & phlegm_score.ge(80) & low_activity
-    high_rule_3 = test_frame["体质标签"].eq(5) & phlegm_score.ge(60) & test_frame["尿酸异常"].eq(1)
-    expected_high = high_rule_1 | high_rule_2 | high_rule_3
-    expected_medium = (~expected_high) & (
-        lipid_abnormal | phlegm_score.ge(60) | low_activity | metabolic_abnormal
-    )
-    expected_code = np.where(expected_high, 3, np.where(expected_medium, 2, 1))
     predictions = q2["test_predictions"].reset_index(drop=True)
     assert predictions["样本ID"].is_unique
     assert predictions["非血脂筛查概率"].between(0, 1).all()
-    assert np.array_equal(predictions["最终管理等级编码"].to_numpy(int), expected_code)
-
-    expected_triggers: list[str] = []
-    for position, idx in enumerate(test_frame.index):
-        reasons: list[str] = []
-        if bool(high_rule_1.loc[idx]):
-            reasons.append("血脂异常且痰湿积分≥60")
-        if bool(high_rule_2.loc[idx]):
-            reasons.append("血脂正常、痰湿积分≥80且活动总分<40")
-        if bool(high_rule_3.loc[idx]):
-            reasons.append("痰湿质、痰湿积分≥60且尿酸异常")
-        if not reasons and expected_code[position] == 2:
-            if bool(lipid_abnormal.loc[idx]):
-                reasons.append("血脂异常")
-            if bool(phlegm_score.loc[idx] >= 60):
-                reasons.append("痰湿积分≥60")
-            if bool(low_activity.loc[idx]):
-                reasons.append("活动总分<40")
-            if bool(metabolic_abnormal.loc[idx]):
-                reasons.append("至少一项代谢异常")
-        if not reasons:
-            reasons.append("未触发高危或中危规则")
-        expected_triggers.append("；".join(reasons))
-    assert predictions["触发规则"].tolist() == expected_triggers
-    checks.append("问题二：非血脂模型、三级人数、唯一等级及患者级触发规则通过")
+    expected_code = np.digitize(
+        predictions["非血脂筛查概率"].to_numpy(float), q2["thresholds"], right=False
+    ) + 1
+    assert np.array_equal(predictions["统计风险等级编码"].to_numpy(int), expected_code)
+    assert predictions["统计风险等级"].notna().all()
+    assert predictions["CART代理路径"].str.len().gt(0).all()
+    assert predictions["临床管理提示"].notna().all()
+    assert predictions["临床管理依据"].notna().all()
+    assert q2["cart_rules"]["叶节点规则"].str.len().gt(0).all()
+    assert len(q2["patient_results"]) == len(df)
+    assert q2["patient_results"]["样本ID"].is_unique
+    assert set(q2["patient_results"]["概率来源"]) == {"训练集折外", "独立测试集"}
+    assert not q2["combinations"]["核心特征组合"].str.contains("血脂", na=False).any()
+    checks.append("问题二：训练内切点、唯一统计等级、CART代理及独立临床提示通过")
 
     # 问题三：全体方案约束通过，并锁定论文引用的样本1—3方案。
     assert q3["all_plans_feasible"]
@@ -1325,7 +1611,14 @@ def validate_results(
         row = summary.loc[summary["样本ID"].eq(sample_id)].iloc[0]
         assert np.isclose(row["最终痰湿积分"], expected_score, atol=1e-9)
         assert int(row["六个月总成本"]) == expected_cost
-    checks.append("问题三：全体可行性、预算与样本1—3方案通过")
+        selected = q3["pareto_123"].loc[
+            q3["pareto_123"]["样本ID"].eq(sample_id)
+            & np.isclose(q3["pareto_123"]["总成本"], expected_cost)
+            & np.isclose(q3["pareto_123"]["最终积分"], expected_score)
+        ]
+        assert len(selected) == 1
+    assert all(q3["selected_on_frontier"].values())
+    checks.append("问题三：全体可行性、预算与样本1—3 Pareto选择点通过")
 
     return {"status": "PASS", "check_count": len(checks), "checks": checks}
 
